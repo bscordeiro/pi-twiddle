@@ -1,0 +1,35 @@
+{
+  "name": "pi-twiddle",
+  "version": "2.0.0",
+  "private": false,
+  "type": "module",
+  "description": "Prompt distillation extension for pi.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "config.ts",
+    "intent.ts",
+    "optimizer.ts",
+    "preserve.ts",
+    "project.ts",
+    "tokenizer.ts",
+    "assets/",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.8"
+  }
+}
