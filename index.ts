@@ -12,7 +12,6 @@
  *   /twiddle        — show current config
  *   /twiddle-model  — select optimization model
  *   /twiddle-threshold — show/set token budget (0–500%)
- *   /twiddle-compress — set compression (off, auto, max)
  *   /twiddle-reset  — clear config
  *   /twiddle-auto-on     — enable auto-mode (footer: ✨ Twiddle)
  *   /twiddle-auto-off    — disable auto-mode (footer: ~ Twiddle)
@@ -24,6 +23,7 @@ import { readConfig, getConfig, writeConfig, type TwiddleConfig } from "./config
 import { optimizePrompt, buildSystemPrompt, detectScope, type Scope } from "./optimizer";
 import { detectIntent, type IntentCategory } from "./intent";
 import { detectProjectContext, getCachedContext, type ProjectContext } from "./project";
+import { decideMissingModelSetup } from "./missing-model-warning";
 
 // ──────────────────────────────────────────────
 //  Types
@@ -378,7 +378,7 @@ export default function (pi: ExtensionAPI) {
 			const config = await getConfig();
 			const autoStatus = config.auto ? "auto" : "manual";
 			twiddleNotify(ctx, config, "normal",
-				`Twiddle  •  ${formatModelRef(config)}  •  threshold: ${config.threshold ?? 20}%  •  timeout: ${config.timeout ?? 15}s  •  verbose: ${config.verbose ?? "normal"}  •  compress: ${config.compressionLevel ?? "off"}  •  mode: ${autoStatus}`,
+				`Twiddle  •  ${formatModelRef(config)}  •  threshold: ${config.threshold ?? 40}%  •  timeout: ${config.timeout ?? 15}s  •  verbose: ${config.verbose ?? "normal"}  •  mode: ${autoStatus}`,
 			);
 		},
 	});
@@ -420,7 +420,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (!args) {
 				twiddleNotify(ctx, config, "normal",
-					`Current threshold: ${config.threshold ?? 20}%. Use /twiddle-threshold <N> to change (ex: /twiddle-threshold 40).`,
+					`Current threshold: ${config.threshold ?? 40}%. Use /twiddle-threshold <N> to change (ex: /twiddle-threshold 40).`,
 				);
 				return;
 			}
@@ -441,7 +441,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("twiddle-reset", {
 		description: "Twiddle: reset config to defaults",
 		handler: async (_args, ctx) => {
-			await writeConfig({ threshold: 20, auto: false });
+			await writeConfig({ threshold: 40, auto: false });
 			const config = await getConfig();
 			updateFooterStatus(ctx, config, stats);
 			twiddleNotify(ctx, config, "normal", "Twiddle config reset.");
@@ -467,42 +467,6 @@ export default function (pi: ExtensionAPI) {
 			await writeConfig(config);
 			updateFooterStatus(ctx, config, stats);
 			twiddleNotify(ctx, config, "normal", "auto-mode OFF — use ~ prefix to optimize.");
-		},
-	});
-
-	pi.registerCommand("twiddle-compress", {
-		description: "Twiddle: set compression level (off, auto, max)",
-		handler: async (args, ctx) => {
-			const config = await getConfig();
-
-			if (!args) {
-				const current = config.compressionLevel ?? "off";
-				const desc: Record<string, string> = {
-					off: "no extra compression",
-					auto: "trivial/low prompts only",
-					max: "all prompts",
-				};
-				ctx.ui.notify(
-					`Compression level: ${current} (${desc[current]}). Use /twiddle-compress off|auto|max.`,
-					"info",
-				);
-				return;
-			}
-
-			const level = args.toLowerCase().trim();
-			if (level !== "off" && level !== "auto" && level !== "max") {
-				ctx.ui.notify("Use: off, auto, or max.", "error");
-				return;
-			}
-
-			config.compressionLevel = level as "off" | "auto" | "max";
-			await writeConfig(config);
-			const desc: Record<string, string> = {
-				off: "no extra compression",
-				auto: "trivial/low prompts only",
-				max: "all prompts",
-			};
-			ctx.ui.notify(`Compression level: ${level} (${desc[level]}).`, "info");
 		},
 	});
 
@@ -679,12 +643,11 @@ export default function (pi: ExtensionAPI) {
 
 				const options = [
 					`Model: ${config.model ? `${config.model.provider}/${config.model.id}` : "not set"}`,
-					`Threshold: ${config.threshold ?? 20}%`,
+					`Threshold: ${config.threshold ?? 40}%`,
 					`Timeout: ${config.timeout ?? 15}s`,
 					`Verbosity: ${config.verbose ?? "normal"}`,
 					`Auto-mode: ${config.auto ? "ON" : "OFF"}`,
 					`Quick model: ${config.quickModel ? `${config.quickModel.provider}/${config.quickModel.id}` : "none"}`,
-					`Compression: ${config.compressionLevel ?? "off"}`,
 					`Fallbacks: ${fallbackList}`,
 					"Exit setup",
 				];
@@ -767,16 +730,7 @@ export default function (pi: ExtensionAPI) {
 						}
 						break;
 					}
-					case 6: { // Compression
-						const options = ["off", "auto", "max"];
-						const pick = await ctx.ui.select("Compression level:", options);
-						if (pick !== undefined) {
-							config.compressionLevel = pick as "off" | "auto" | "max";
-							await writeConfig(config);
-						}
-						break;
-					}
-					case 7: { // Fallbacks
+					case 6: { // Fallbacks
 						const fbOptions = [
 							"Add fallback",
 							"Remove fallback",
@@ -838,7 +792,6 @@ export default function (pi: ExtensionAPI) {
 	interface OptimizationRequest {
 		effectiveText: string;
 		forcedIntent?: IntentCategory;
-		compressionLevel?: "off" | "auto" | "max";
 		model: { provider: string; id: string };
 		fallbackModels?: Array<{ provider: string; id: string }>;
 		quickModel?: { provider: string; id: string };
@@ -868,7 +821,6 @@ export default function (pi: ExtensionAPI) {
 			projectContext: projectContext ?? undefined,
 			thinkingLevel,
 			scope,
-			compressionLevel: req.compressionLevel ?? "off",
 		});
 
 		startTwiddleAnim(ctx, config, stats);
@@ -924,15 +876,53 @@ export default function (pi: ExtensionAPI) {
 	// um comando (/skill ~texto), before_agent_start deve pular.
 	// Também usada em auto-mode para proteger comandos sem ~.
 	let skipAgentOptimization = false;
+	let missingModelSetupSilencedForSession = false;
+
+	async function ensureModelConfigured(text: string, ctx: any, config: TwiddleConfig): Promise<boolean> {
+		const decision = decideMissingModelSetup(text, {
+			hasModel: Boolean(config.model),
+			sessionSilenced: missingModelSetupSilencedForSession,
+		});
+		if (!decision.missingModel) return true;
+		if (!decision.shouldPrompt) return false;
+
+		const models = ctx.modelRegistry.getAvailable();
+		if (models.length === 0) {
+			missingModelSetupSilencedForSession = true;
+			twiddleNotify(ctx, config, "normal",
+				"Twiddle: no models available. Configure an API key first. Prompts will be sent unchanged this session.",
+				"warning",
+			);
+			return false;
+		}
+
+		const options = models.map((model: Model) => pickModelLabel(model));
+		options.push("Cancel");
+		const choice = await ctx.ui.select("Twiddle needs an optimization model:", options);
+		if (choice === undefined || choice === "Cancel") {
+			missingModelSetupSilencedForSession = true;
+			twiddleNotify(ctx, config, "normal",
+				"Twiddle: no model selected. Prompts will be sent unchanged this session. Use /twiddle-model to enable optimization.",
+				"warning",
+			);
+			return false;
+		}
+
+		const selected = models[options.indexOf(choice)];
+		config.model = { provider: selected.provider, id: selected.id };
+		await writeConfig(config);
+		updateFooterStatus(ctx, config, stats);
+		twiddleNotify(ctx, config, "normal", `Twiddle model: ${pickModelLabel(selected)}`);
+		return true;
+	}
 
 	// ── Input Event ────────────────────────────
 	// Intercepta /command ~texto ANTES da expansão de skills.
 	// Extrai o texto após ~, otimiza, e reconstroi o comando.
 	pi.on("input", async (event, ctx) => {
 		const config = await getConfig();
-		if (!config.model) return;
-
 		const text = event.text;
+
 		if (!text.startsWith("/")) return; // not a command, let before_agent_start handle it
 
 		const tildeIdx = text.indexOf(" ~");
@@ -950,6 +940,12 @@ export default function (pi: ExtensionAPI) {
 		const rawText = text.slice(tildeIdx + 2).trim();
 		if (!rawText) return;
 
+		const hasModel = await ensureModelConfigured(text, ctx, config);
+		if (!hasModel || !config.model) {
+			skipAgentOptimization = true;
+			return;
+		}
+
 		skipAgentOptimization = true;
 		const startTime = Date.now();
 
@@ -964,11 +960,10 @@ export default function (pi: ExtensionAPI) {
 			const { fr, elapsed } = await runOptimizationCore({
 				effectiveText,
 				forcedIntent: parsed.intent,
-				compressionLevel: config.compressionLevel ?? "off",
 				model: config.model,
 				fallbackModels: config.fallbackModels,
 				quickModel: config.quickModel,
-				threshold: config.threshold ?? 20,
+				threshold: config.threshold ?? 40,
 				timeoutSeconds: config.timeout ?? 15,
 				startTime,
 			}, ctx, config);
@@ -1023,7 +1018,6 @@ export default function (pi: ExtensionAPI) {
 		quiet?: boolean;
 		verbose?: string;
 		timeoutSeconds?: number;
-		compressionLevel?: "off" | "auto" | "max";
 	} | null = null;
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -1061,13 +1055,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (!config.model) {
-			twiddleNotify(ctx, config, "normal",
-				"Twiddle: no model configured. Use /twiddle-model.",
-				"warning",
-			);
-			return;
-		}
+		const hasModel = await ensureModelConfigured(event.prompt, ctx, config);
+		if (!hasModel || !config.model) return;
 
 		const mode = config.auto ? "auto" : "~";
 
@@ -1078,13 +1067,12 @@ export default function (pi: ExtensionAPI) {
 			fallbackModels: config.fallbackModels,
 			quickModel: config.quickModel,
 			startTime: Date.now(),
-			threshold: config.threshold ?? 20,
+			threshold: config.threshold ?? 40,
 			mode,
 			forcedIntent: parsed.intent,
 			quiet: parsed.quiet,
 			verbose: config.verbose ?? "normal",
 			timeoutSeconds: config.timeout ?? 15,
-			compressionLevel: config.compressionLevel ?? "off",
 		};
 	});
 
@@ -1104,7 +1092,6 @@ export default function (pi: ExtensionAPI) {
 			quiet,
 			verbose,
 			timeoutSeconds,
-			compressionLevel,
 		} = pendingOptimization;
 		pendingOptimization = null;
 
@@ -1114,7 +1101,6 @@ export default function (pi: ExtensionAPI) {
 			const { fr, elapsed } = await runOptimizationCore({
 				effectiveText,
 				forcedIntent,
-				compressionLevel: compressionLevel ?? "off",
 				model: modelRef,
 				fallbackModels,
 				quickModel,

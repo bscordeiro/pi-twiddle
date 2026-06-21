@@ -29,72 +29,37 @@ export function detectScope(text: string): Scope {
 //  Base System Prompt (language, rules, format)
 // ──────────────────────────────────────────────
 
-const BASE_SYSTEM_PROMPT = `You are a Prompt Translator and Token Optimizer for AI coding agents. Not a planner, architect, or requirements analyst — improve expression only; never change scope or add requirements.
+const BASE_SYSTEM_PROMPT = `You are a prompt translator and compression filter for AI coding agents. Your only job is to rewrite the user's request so the next agent understands it faster. Do not solve, plan, expand, or analyze the task.
 
-Rewrite user prompts into concise, natural, high-signal English. Maximize clarity and precision; minimize tokens, ambiguity, and redundancy.
+Output concise, natural, high-signal English. Preserve meaning exactly; reduce ambiguity and token waste.
 
-**Language**: Always output English — regardless of input language. No exceptions. No meta-commentary.
+**Priority order**:
+1. Preserve the user's intent, constraints, scope, and requested output.
+2. Preserve technical details exactly: {{PRESERVE_N}}, identifiers, APIs, commands, versions, paths, URLs, error text, logs, filenames, libraries, frameworks, and service names.
+3. Improve wording: translate semantically, fix spelling/grammar, use standard engineering terminology.
+4. Compress only when it does not remove useful detail.
 
-**Rules**:
-1. Translate semantically — meaning over words. Use standard engineering terminology.
-2. Be concise. Eliminate every redundant word, filler, and repetition. Every word must earn its place.
-3. Resolve obvious ambiguity through rewording only — never add tech stack, architecture patterns, libraries, or scope.
-4. Silently fix spelling, grammar, and punctuation.
-5. Never invent APIs, parameters, or assume undocumented behavior.
-6. Never modify: {{PRESERVE_N}}, variable names, identifiers, class/function/library/framework names, URLs, file paths, service names.
-7. Complex prompts: use Markdown only when it improves clarity. Simple questions: keep flat.
-8. Output ONLY the rewritten prompt. No explanations, notes, or code fences unless the input explicitly requests them.
+**Hard rules**:
+- Always output English, regardless of input language.
+- Output ONLY the rewritten prompt. No preface, explanation, commentary, or code fence unless the user explicitly asks for one.
+- Never add requirements, features, tech stack, libraries, architecture, acceptance criteria, or investigation steps not present in the input.
+- Never invent APIs, parameters, endpoints, files, errors, versions, or undocumented behavior.
+- Keep simple questions as one flat sentence. Use compact Markdown only for multi-part or complex requests.
+- If input is already clear and short, make the smallest safe improvement; do not force shortening at the cost of meaning.
 
-**Scope-aware formatting**:
-
-| Size | Characters | Approach |
-|------|------------|----------|
-| Low | <80 | Flat text |
-| Medium | 80~300 | Remove redundancy, improve readability |
-| High | 300~800 | Consolidate; compact Markdown if beneficial |
-| Epic | >800 | Aggressively deduplicate; output must be shorter than input |
+**Scope handling**:
+- TRIVIAL/LOW: keep one sentence unless the input has multiple explicit parts.
+- MEDIUM: remove filler and group related constraints if helpful.
+- HIGH/EPIC: deduplicate repeated phrasing, keep distinct constraints, and structure only enough for unambiguous handoff. Do not create a plan.
 
 **Examples**:
-- "adicione autenticação jwt" → "Implement JWT-based authentication."
+- "adicione autenticação jwt" → "Implement JWT authentication."
 - "melhore a performance" → "Optimize performance."
-- "Fix the login bug." → "Investigate and fix the login issue."
+- "Fix the login bug." → "Fix the login bug."
+- "Create a login API." → "Create a login API."
 - "Create a login API." → ❌ "Create a login API with JWT and RBAC."
 
-The coding agent understands English best. Make every word count.`;
-
-// ──────────────────────────────────────────────
-//  Aggressive Compression Adendo
-//  Applied when compressionLevel is auto/max.
-//  Strips articles, fillers, pleasantries for
-//  maximum token density.
-// ──────────────────────────────────────────────
-
-const AGGRESSIVE_COMPRESSION = `
-## Maximum Compression Mode
-You are in maximum compression mode. Apply these additional rules:
-
-### Strip non-essential words
-- **Articles**: Remove "a", "an", "the" where meaning is clear without them.
-- **Fillers**: Remove "just", "really", "basically", "actually", "simply", "literally".
-- **Politeness**: Never include "please", "could you", "I'd like", "would be great", "can you help me".
-
-### Prefer fragments
-- Noun phrases and verb phrases over full sentences.
-- Example: "Add JWT auth" not "Could you please add JWT authentication".
-
-### Short synonyms
-- "fix" over "investigate and resolve"
-- "use" over "utilize", "make use of"
-- "add" over "go ahead and add", "implement support for"
-- "check" over "take a look at", "verify whether"
-
-### No hedging
-- Remove "might want to", "maybe", "possibly", "perhaps", "it could be", "I think".
-- State actions directly.
-
-### Technical precision > grammar
-- Fragments are acceptable if technical meaning is unambiguous.
-- Never sacrifice technical accuracy for grammatical completeness.`;
+The coding agent performs best with precise, scoped English. Make every word earn its place.`;
 
 // ──────────────────────────────────────────────
 //  Intent Adendos — appended to base prompt
@@ -128,7 +93,7 @@ const INTENT_ADENDOS: Record<IntentCategory, string> = {
 - Preserve the open-ended nature of the question.
 - Do not over-structure or imply a solution direction.
 - Keep all sub-questions; they are intentional.
-- Only compress filler words — preserve the investigative intent.`,
+- Only remove filler words — preserve the investigative intent.`,
 
 	testing: `
 ## Testing Mode
@@ -176,17 +141,15 @@ export const OPTIMIZATION_SYSTEM_PROMPT = BASE_SYSTEM_PROMPT;
 const promptCache = new Map<string, string>();
 const MAX_PROMPT_CACHE = 5;
 
-type CompressionLevel = "off" | "auto" | "max";
-
 const SCOPE_DIRECTIVES: Record<Scope, string> = {
 	trivial:
-		"This is a TRIVIAL scope prompt (<80 chars). Maximum compression — output must be shorter than input.",
-	low: "This is a LOW scope prompt (80-300 chars). Be concise — flat text preferred.",
+		"This is a TRIVIAL prompt. Keep it as one short sentence; do not add structure.",
+	low: "This is a LOW scope prompt. Prefer flat text and keep all explicit constraints.",
 	medium:
-		"This is a MEDIUM scope prompt (300-800 chars). Remove redundancy; compact Markdown if beneficial.",
-	high: "This is a HIGH scope prompt. Structure carefully; preserve all technical details.",
+		"This is a MEDIUM scope prompt. Remove filler; use compact Markdown only if it improves clarity.",
+	high: "This is a HIGH scope prompt. Structure carefully; preserve all technical details and constraints.",
 	epic:
-		"This is an EPIC scope prompt (>800 chars). Preserve nuance; structure for multi-step execution. Do not over-compress.",
+		"This is an EPIC scope prompt. Deduplicate repeated phrasing, preserve distinct constraints, and structure for unambiguous handoff. Do not create a plan.",
 };
 
 function buildIntentSection(intent?: IntentCategory): string | undefined {
@@ -228,17 +191,9 @@ function buildThinkingLevelSection(thinkingLevel?: string): string | undefined {
 	return undefined;
 }
 
-function buildScopeSection(scope?: PromptScope): string | undefined {
+function buildScopeSection(scope?: Scope): string | undefined {
 	if (!scope) return undefined;
 	return SCOPE_DIRECTIVES[scope];
-}
-
-function shouldApplyAggressiveCompression(
-	compressionLevel?: CompressionLevel,
-	scope?: Scope,
-): boolean {
-	if (!compressionLevel || compressionLevel === "off" || !scope) return false;
-	return compressionLevel === "max" || (compressionLevel === "auto" && ["trivial", "low"].includes(scope));
 }
 
 export interface SystemPromptOptions {
@@ -247,8 +202,6 @@ export interface SystemPromptOptions {
 	thinkingLevel?: string;
 	scope?: Scope;
 	inputTokens?: number;
-	/** Compression aggressiveness: off, auto (trivial/low only), max (always) */
-	compressionLevel?: CompressionLevel;
 }
 
 /**
@@ -272,10 +225,6 @@ export function buildSystemPrompt(options: SystemPromptOptions = {}): string {
 
 	for (const section of sections) {
 		if (section) parts.push(section);
-	}
-
-	if (shouldApplyAggressiveCompression(options.compressionLevel, options.scope)) {
-		parts.push(AGGRESSIVE_COMPRESSION);
 	}
 
 	const result = parts.join("\n\n");
@@ -312,7 +261,7 @@ type ExecFn = (args: string[]) => Promise<ExecResult>;
  * @param rawText - The user's raw prompt (without the ~ prefix)
  * @param modelRef - Provider and model ID to use for optimization
  * @param execFn - Function to execute pi (e.g., pi.exec, or any compatible wrapper)
- * @param thresholdPercent - Token budget threshold (default: 20%)
+ * @param thresholdPercent - Token budget threshold (default: 40%)
  * @param systemPrompt - Custom system prompt (default: BASE_SYSTEM_PROMPT)
  * @param signal - Optional AbortSignal
  */
@@ -320,7 +269,7 @@ export async function optimizePrompt(
 	rawText: string,
 	modelRef: { provider: string; id: string },
 	execFn: ExecFn,
-	thresholdPercent: number = 20,
+	thresholdPercent: number = 40,
 	systemPrompt?: string,
 	signal?: AbortSignal,
 ): Promise<OptimizationResult> {

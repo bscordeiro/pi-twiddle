@@ -12,7 +12,7 @@ export interface TwiddleConfig {
 		provider: string;
 		id: string;
 	};
-	/** Token budget threshold percentage (default: 20 = 20% above input) */
+	/** Token budget threshold percentage (default: 40 = 40% above input) */
 	threshold: number;
 	/** Auto-mode: optimize every prompt without requiring ~ prefix */
 	auto: boolean;
@@ -24,8 +24,6 @@ export interface TwiddleConfig {
 	fallbackModels?: Array<{ provider: string; id: string }>;
 	/** Fast model for trivial/low scope prompts (optional) */
 	quickModel?: { provider: string; id: string };
-	/** Compression aggressiveness: off, auto (trivial/low only), max (always) */
-	compressionLevel?: "off" | "auto" | "max";
 }
 
 const CONFIG_FILENAME = "config.json";
@@ -45,7 +43,7 @@ export async function readConfig(): Promise<TwiddleConfig> {
 		const raw = await readFile(configPath, "utf-8");
 		return JSON.parse(raw) as TwiddleConfig;
 	} catch {
-		return { threshold: 20, auto: false, verbose: "normal", timeout: 15 };
+		return { threshold: 40, auto: false, verbose: "normal", timeout: 15 };
 	}
 }
 

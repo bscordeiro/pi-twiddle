@@ -10,8 +10,15 @@ describe("buildSystemPrompt", () => {
 
 	it("includes base rules in every prompt", () => {
 		const result = buildSystemPrompt();
-		expect(result).toContain("Prompt Translator");
+		expect(result).toContain("prompt translator");
 		expect(result).toContain("Output ONLY the rewritten prompt");
+	});
+
+	it("forbids scope expansion in the base prompt", () => {
+		const result = buildSystemPrompt();
+		expect(result).toContain("Never add requirements");
+		expect(result).toContain("Fix the login bug.\" → \"Fix the login bug.");
+		expect(result).not.toContain("Investigate and fix the login issue");
 	});
 
 	it("appends intent adendo for bug_fix", () => {
@@ -74,23 +81,9 @@ describe("buildSystemPrompt", () => {
 	it("includes scope directive for epic", () => {
 		const result = buildSystemPrompt({ scope: "epic" });
 		expect(result).toContain("EPIC");
-	});
-
-	it("adds aggressive compression when level is max", () => {
-		const result = buildSystemPrompt({ compressionLevel: "max", scope: "medium" });
-		expect(result).toContain("Maximum Compression Mode");
-	});
-
-	it("adds aggressive compression for auto only on trivial/low", () => {
-		const trivial = buildSystemPrompt({ compressionLevel: "auto", scope: "trivial" });
-		const medium = buildSystemPrompt({ compressionLevel: "auto", scope: "medium" });
-		expect(trivial).toContain("Maximum Compression Mode");
-		expect(medium).not.toContain("Maximum Compression Mode");
-	});
-
-	it("does not add aggressive compression when level is off", () => {
-		const result = buildSystemPrompt({ compressionLevel: "off", scope: "trivial" });
-		expect(result).not.toContain("Maximum Compression Mode");
+		expect(result).toContain("unambiguous handoff");
+		expect(result).toContain("Do not create a plan");
+		expect(result).not.toContain("safe multi-step execution");
 	});
 
 	it("returns cached result for same options", () => {

@@ -1,8 +1,8 @@
 ![Twiddle](assets/icon.png)
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://img.shields.io/badge/pi--twiddle-v2.0-2a2a2a?style=flat&labelColor=111&color=555">
-  <img alt="pi-twiddle" src="https://img.shields.io/badge/pi--twiddle-v2.0-f5f5f5?style=flat&labelColor=eee&color=999">
+  <source media="(prefers-color-scheme: dark)" srcset="https://img.shields.io/badge/pi--twiddle-v2.1-2a2a2a?style=flat&labelColor=111&color=555">
+  <img alt="pi-twiddle" src="https://img.shields.io/badge/pi--twiddle-v2.1-f5f5f5?style=flat&labelColor=eee&color=999">
 </picture>
 
 # Twiddle
@@ -28,6 +28,10 @@
 
 ~explique o padrão Repository em NestJS com exemplos
 ```
+
+If no optimization model is configured yet, Twiddle offers the available models once per session. Selecting a model saves it and continues optimization; canceling sends prompts unchanged for the rest of the session.
+
+Default token budget threshold is 40%.
 
 ## Activation
 
@@ -57,7 +61,6 @@
 | `/twiddle-model` | Select optimization model |
 | `/twiddle-threshold` [0–500] | Set token budget margin |
 | `/twiddle-timeout` [5–60] | Set per-model timeout in seconds |
-| `/twiddle-compress` off\|auto\|max | Set compression aggressiveness |
 | `/twiddle-fallback` add\|remove\|list\|clear | Manage fallback chain |
 | `/twiddle-verbose` quiet\|normal\|debug | Set notification verbosity |
 | `/twiddle-auto-on` | Enable auto-mode |
