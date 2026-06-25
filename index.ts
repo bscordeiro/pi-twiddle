@@ -13,13 +13,14 @@
  *   /twiddle-model  — select optimization model
  *   /twiddle-threshold — show/set token budget (0–500%)
  *   /twiddle-reset  — clear config
- *   /twiddle-auto-on     — enable auto-mode (footer: ✨ Twiddle)
+ *   /twiddle-auto-on     — enable auto-mode (footer: ≈ Twiddle)
  *   /twiddle-auto-off    — disable auto-mode (footer: ~ Twiddle)
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { readConfig, getConfig, writeConfig, type TwiddleConfig } from "./config";
+import { formatFooterLabel, formatFooterShimmerFrame } from "./footer";
 import { optimizePrompt, buildSystemPrompt, detectScope, type Scope } from "./optimizer";
 import { detectIntent, type IntentCategory } from "./intent";
 import { detectProjectContext, getCachedContext, type ProjectContext } from "./project";
@@ -62,26 +63,8 @@ function formatModelRef(config: TwiddleConfig): string {
 //  Footer Status
 // ──────────────────────────────────────────────
 
-function formatCompactNumber(n: number): string {
-	if (n > -999 && n < 999) return `${n}`;
-	const abs = Math.abs(n);
-	const sign = n < 0 ? "-" : "";
-	if (abs < 1_000_000) {
-		const k = abs / 1_000;
-		const formatted = (Math.round(k * 10) / 10).toFixed(1);
-		return `${sign}${formatted.replace(/\.0$/, "")}k`;
-	}
-	const m = abs / 1_000_000;
-	const formatted = (Math.round(m * 10) / 10).toFixed(1);
-	return `${sign}${formatted.replace(/\.0$/, "")}M`;
-}
-
-function updateFooterStatus(ctx: any, config: TwiddleConfig, stats?: { totalTokensSaved: number }): void {
-	const base = config.auto ? "✨Twiddle" : "~Twiddle";
-	const suffix = stats
-		? `[${formatCompactNumber(stats.totalTokensSaved)}]`
-		: "";
-	ctx.ui.setStatus("tw", ctx.ui.theme.fg("dim", `${base}${suffix}`));
+function updateFooterStatus(ctx: any, config: TwiddleConfig): void {
+	ctx.ui.setStatus("tw", ctx.ui.theme.fg("dim", formatFooterLabel(config)));
 }
 
 // ──────────────────────────────────────────────
@@ -236,7 +219,6 @@ export default function (pi: ExtensionAPI) {
 		totalBudgetExceeded: 0,
 		shortResponseCount: 0,
 		fallbackUsed: 0,
-		totalTokensSaved: 0,
 	};
 
 	// Last optimization details (for /twiddle-report preview)
@@ -260,54 +242,24 @@ export default function (pi: ExtensionAPI) {
 	let animTimer: ReturnType<typeof setInterval> | null = null;
 	let animFrame = 0;
 
-	// RGB color cycle — smooth rainbow sweep for epic glow effect
-	function hslToAnsi(h: number, s: number, l: number): string {
-		const c = (1 - Math.abs(2 * l - 1)) * s;
-		const hh = h / 60;
-		const x = c * (1 - Math.abs((hh % 2) - 1));
-		const m = l - c / 2;
-		let r: number, g: number, b: number;
-		if (hh < 1) { r = c; g = x; b = 0; }
-		else if (hh < 2) { r = x; g = c; b = 0; }
-		else if (hh < 3) { r = 0; g = c; b = x; }
-		else if (hh < 4) { r = 0; g = x; b = c; }
-		else if (hh < 5) { r = x; g = 0; b = c; }
-		else { r = c; g = 0; b = x; }
-		const R = Math.round((r + m) * 255);
-		const G = Math.round((g + m) * 255);
-		const B = Math.round((b + m) * 255);
-		return `\x1b[38;2;${R};${G};${B}m`;
-	}
-
-	function labelAndSuffix(config: TwiddleConfig, statsArg?: { totalTokensSaved: number }): [string, string] {
-		const prefix = config.auto ? "✨" : "~";
-		const suffix = statsArg
-			? `[${formatCompactNumber(statsArg.totalTokensSaved)}]`
-			: "";
-		return [prefix, suffix];
-	}
-
-	function startTwiddleAnim(ctx: any, config: TwiddleConfig, statsArg?: { totalTokensSaved: number }) {
+	function startTwiddleAnim(ctx: any, config: TwiddleConfig) {
 		if (animTimer) return;
-		const [prefix, suffix] = labelAndSuffix(config, statsArg);
 		animFrame = 0;
 		const step = () => {
-			const hue = (animFrame * 5) % 360;
-			const color = hslToAnsi(hue, 1.0, 0.55);
-			ctx.ui.setStatus("tw", `${color}${prefix}Twiddle${suffix}\x1b[0m`);
+			ctx.ui.setStatus("tw", formatFooterShimmerFrame(config, animFrame));
 			animFrame++;
 		};
 		step();
-		animTimer = setInterval(step, 200);
+		animTimer = setInterval(step, 160);
 	}
 
-	function stopTwiddleAnim(ctx: any, config: TwiddleConfig, statsArg?: { totalTokensSaved: number }) {
+	function stopTwiddleAnim(ctx: any, config: TwiddleConfig) {
 		if (animTimer) {
 			clearInterval(animTimer);
 			animTimer = null;
 		}
 		animFrame = 0;
-		updateFooterStatus(ctx, config, statsArg);
+		updateFooterStatus(ctx, config);
 	}
 
 	// ── Session Start: Project Context Detection ──
@@ -319,7 +271,7 @@ export default function (pi: ExtensionAPI) {
 			// Project detection failed — optimization will run without context.
 		}
 		const config = await getConfig();
-		updateFooterStatus(ctx, config, stats);
+		updateFooterStatus(ctx, config);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -405,7 +357,7 @@ export default function (pi: ExtensionAPI) {
 				const selected = all[idx];
 				config.model = { provider: selected.provider, id: selected.id };
 				await writeConfig(config);
-				updateFooterStatus(ctx, config, stats);
+				updateFooterStatus(ctx, config);
 				twiddleNotify(ctx, config, "normal",
 					`Twiddle model: ${pickModelLabel(selected)}`,
 				);
@@ -443,18 +395,18 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			await writeConfig({ threshold: 40, auto: false });
 			const config = await getConfig();
-			updateFooterStatus(ctx, config, stats);
+			updateFooterStatus(ctx, config);
 			twiddleNotify(ctx, config, "normal", "Twiddle config reset.");
 		},
 	});
 
 	pi.registerCommand("twiddle-auto-on", {
-		description: "Twiddle: enable auto-mode (footer: ✨ Twiddle)",
+		description: "Twiddle: enable auto-mode (footer: ≈ Twiddle)",
 		handler: async (_args, ctx) => {
 			const config = await getConfig();
 			config.auto = true;
 			await writeConfig(config);
-			updateFooterStatus(ctx, config, stats);
+			updateFooterStatus(ctx, config);
 			twiddleNotify(ctx, config, "normal", "auto-mode ON — all prompts optimized.");
 		},
 	});
@@ -465,7 +417,7 @@ export default function (pi: ExtensionAPI) {
 			const config = await getConfig();
 			config.auto = false;
 			await writeConfig(config);
-			updateFooterStatus(ctx, config, stats);
+			updateFooterStatus(ctx, config);
 			twiddleNotify(ctx, config, "normal", "auto-mode OFF — use ~ prefix to optimize.");
 		},
 	});
@@ -823,7 +775,7 @@ export default function (pi: ExtensionAPI) {
 			scope,
 		});
 
-		startTwiddleAnim(ctx, config, stats);
+		startTwiddleAnim(ctx, config);
 		const fr = await optimizeWithFallback(
 			req.effectiveText,
 			req.model,
@@ -836,7 +788,7 @@ export default function (pi: ExtensionAPI) {
 			req.quickModel,
 			ctx.signal ?? undefined,
 		);
-		stopTwiddleAnim(ctx, config, stats);
+		stopTwiddleAnim(ctx, config);
 
 		const elapsed = ((Date.now() - req.startTime) / 1000).toFixed(1);
 		lastPromptWasOptimized = true;
@@ -847,8 +799,6 @@ export default function (pi: ExtensionAPI) {
 		stats.totalElapsed += parseFloat(elapsed);
 		if (fr.result.exceedsBudget) stats.totalBudgetExceeded++;
 		if (fr.isFallback) stats.fallbackUsed++;
-		stats.totalTokensSaved += fr.result.inputTokens - fr.result.outputTokens;
-
 		lastOptimization = {
 			text: fr.result.optimizedText,
 			intent,
@@ -911,7 +861,7 @@ export default function (pi: ExtensionAPI) {
 		const selected = models[options.indexOf(choice)];
 		config.model = { provider: selected.provider, id: selected.id };
 		await writeConfig(config);
-		updateFooterStatus(ctx, config, stats);
+		updateFooterStatus(ctx, config);
 		twiddleNotify(ctx, config, "normal", `Twiddle model: ${pickModelLabel(selected)}`);
 		return true;
 	}
@@ -991,7 +941,7 @@ export default function (pi: ExtensionAPI) {
 			skipAgentOptimization = false;
 			const message = err instanceof Error ? err.message : String(err);
 			const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-			stopTwiddleAnim(ctx, config, stats);
+			stopTwiddleAnim(ctx, config);
 			pi.sendMessage({
 				customType: "twiddle",
 				content: `Twiddle~ ⚠️ ${buildModelChain(config.model, config.fallbackModels)} | all failed in ${elapsed}s | ${message}`,
@@ -1144,7 +1094,7 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-			stopTwiddleAnim(ctx, config, stats);
+			stopTwiddleAnim(ctx, config);
 			ctx.ui.notify(`⚠️ Twiddle: ${buildModelChain(modelRef, fallbackModels)} | all failed in ${elapsed}s | ${message}`, "warning");
 			return { messages: event.messages };
 		}

@@ -9,7 +9,7 @@
 
 > Prompt distillation for [pi](https://pi.ai). Twiddle cleans, sharpens, and structures prompts before they reach the agent.
 
-**Not free:** every optimization costs tokens. Tiny prompts can lose more than they save. Watch the footer counter (`✨ Twiddle [12k]` / `~ Twiddle [12k]`) to track net savings.
+**Not free:** every optimization costs tokens. Tiny prompts can cost more than they improve. The footer shows the active mode: `~ Twiddle` for manual mode and `≈ Twiddle` for auto-mode.
 
 ## What it does
 
@@ -52,6 +52,15 @@ Default token budget threshold is 40%.
 | `~design:text` | Force `design` |
 
 **Auto-mode** (`/twiddle-auto-on`): every prompt gets distilled, unless it is a trivial greeting.
+
+## Footer
+
+| Indicator | Mode |
+|---|---|
+| `~ Twiddle` | Manual mode — use `~` to optimize a prompt |
+| `≈ Twiddle` | Auto-mode — eligible prompts are optimized automatically |
+
+While optimization is running, Twiddle uses a subtle shimmer over the name. The footer does not show token savings because Twiddle is focused on clarity, translation, structure, and deduplication rather than savings accounting.
 
 ## Commands
 
@@ -98,6 +107,8 @@ pi-twiddle/
 ├── project.ts
 ├── preserve.ts
 ├── tokenizer.ts
+├── footer.ts
+├── missing-model-warning.ts
 ├── config.ts
 ├── README.md
 ├── package.json
@@ -111,6 +122,6 @@ pi-twiddle/
 - Quiet by default
 - No API key management
 - Graceful fallback on failure
-- Footer shows mode + savings at a glance
+- Footer shows active mode without token-savings counters
 
 _Theme: [Harpy](https://pi.dev/packages/harpy-theme)_

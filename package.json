@@ -11,12 +11,16 @@
   "files": [
     "index.ts",
     "config.ts",
+    "footer.ts",
     "intent.ts",
     "optimizer.ts",
     "preserve.ts",
     "project.ts",
     "tokenizer.ts",
-    "assets/",
+    "missing-model-warning.ts",
+    "assets/icon.png",
+    "assets/prompt-report.png",
+    "assets/settings.png",
     "README.md",
     "LICENSE"
   ],
