@@ -11,6 +11,7 @@ const URL_RE = /https?:\/\/[^\s)]+/g;
 const HEX_HASH_RE = /\b(?=[0-9a-fA-F]*[a-fA-F])(?=[0-9a-fA-F]*[0-9])[0-9a-fA-F]{7,40}\b/g;
 const SEMVER_RE = /\b\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?\b/g;
 const PLACEHOLDER_RE = /\{\{PRESERVE_(\d+)\}\}/g;
+const LITERAL_PLACEHOLDER_RE = /\{\{PRESERVE_\d+\}\}/g;
 
 const PROTECTION_PATTERNS: Array<{ regex: RegExp; statKey: "codeBlocks" | "inlineCode" | "urls" | "hashes" | "versions" }> = [
 	{ regex: CODE_BLOCK_RE, statKey: "codeBlocks" },
@@ -32,6 +33,15 @@ export function extractProtectedFragments(text: string): {
 	const fragments = new Map<number, string>();
 	const stats = { codeBlocks: 0, inlineCode: 0, urls: 0, hashes: 0, versions: 0 };
 	let counter = 0;
+
+	// Protect user-authored markers before generating our own. Otherwise a
+	// literal `{{PRESERVE_1}}` can be mistaken for generated fragment 1.
+	LITERAL_PLACEHOLDER_RE.lastIndex = 0;
+	text = text.replace(LITERAL_PLACEHOLDER_RE, (match) => {
+		counter++;
+		fragments.set(counter, match);
+		return `{{PRESERVE_${counter}}}`;
+	});
 
 	for (const { regex, statKey } of PROTECTION_PATTERNS) {
 		// Reset lastIndex for global regex reuse

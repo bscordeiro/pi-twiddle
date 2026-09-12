@@ -9,22 +9,31 @@
  *   → pi-twiddle extracts the text after ~, optimizes it then passes to the skill.
  *
  * Commands:
- *   /twiddle        — show current config
+ *   /twiddle        — open the control panel (all settings)
  *   /twiddle-model  — select optimization model
- *   /twiddle-threshold — show/set token budget (0–500%)
+ *   /twiddle-threshold — show/set max expansion (0–500%)
  *   /twiddle-reset  — clear config
  *   /twiddle-auto-on     — enable auto-mode (footer: ≈ Twiddle)
  *   /twiddle-auto-off    — disable auto-mode (footer: ~ Twiddle)
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { readConfig, getConfig, writeConfig, type TwiddleConfig } from "./config";
 import { formatFooterLabel, formatFooterShimmerFrame } from "./footer";
 import { optimizePrompt, buildSystemPrompt, detectScope, type Scope } from "./optimizer";
 import { detectIntent, type IntentCategory } from "./intent";
-import { detectProjectContext, getCachedContext, type ProjectContext } from "./project";
+import { detectProjectContext, getCachedContext } from "./project";
+import { filterModels } from "./models";
+import { searchableSelect } from "./picker";
 import { decideMissingModelSetup } from "./missing-model-warning";
+import {
+	applyKnownTransformations,
+	applyTextToUserMessage,
+	loadAppliedTransformations,
+	messageSignature,
+	type AppliedTransformation,
+} from "./history";
 
 // ──────────────────────────────────────────────
 //  Types
@@ -48,15 +57,8 @@ interface TwiddleCustomMessage {
 //  Helpers
 // ──────────────────────────────────────────────
 
-function pickModelLabel(m: Model): string {
+function pickModelLabel(m: Model<Api>): string {
 	return `${m.provider}/${m.id}  (${m.name})`;
-}
-
-function formatModelRef(config: TwiddleConfig): string {
-	if (!config.model) return "none (not configured)";
-	const { provider, id } = config.model;
-	const autoFlag = config.auto ? " auto" : "";
-	return `${provider}/${id}${autoFlag}`;
 }
 
 // ──────────────────────────────────────────────
@@ -71,7 +73,7 @@ function updateFooterStatus(ctx: any, config: TwiddleConfig): void {
 //  Verbosity Filter
 // ──────────────────────────────────────────────
 
-type NotifyLevel = "quiet" | "normal" | "debug";
+type NotifyLevel = "quiet" | "debug";
 
 function twiddleNotify(
 	ctx: any,
@@ -82,8 +84,8 @@ function twiddleNotify(
 	suppress?: boolean,
 ): void {
 	if (suppress) return;
-	const levels: NotifyLevel[] = ["quiet", "normal", "debug"];
-	const current = config.verbose ?? "normal";
+	const levels: NotifyLevel[] = ["quiet", "debug"];
+	const current = config.verbose ?? "quiet";
 	if (levels.indexOf(current) >= levels.indexOf(level)) {
 		ctx.ui.notify(message, severity);
 	}
@@ -167,25 +169,23 @@ async function optimizeWithFallback(
 	threshold: number,
 	systemPrompt: string,
 	timeoutSecs: number,
-	scope: string,
-	quickModel?: { provider: string; id: string },
 	signal?: AbortSignal,
 ): Promise<FallbackResult> {
 	// Always attempt optimization — no circuit breaker.
 	// Try primary once, then each configured fallback once.
 	// Each attempt respects the configured timeout.
 
-	// Use quick model for trivial/low scope if configured
-	const effectivePrimary =
-		quickModel && (scope === "trivial" || scope === "low")
-			? quickModel
-			: primary;
-
-	const models = [effectivePrimary, ...(fallbacks ?? [])];
+	const models = [primary, ...(fallbacks ?? [])];
 	let lastError: Error | undefined;
 
 	for (let i = 0; i < models.length; i++) {
 		const m = models[i];
+		// Explicit cancellation is not a model failure: stop immediately
+		// instead of burning time and tokens on fallbacks. Callers keep the
+		// user's prompt untouched so Cancel never becomes an accidental send.
+		if (signal?.aborted) {
+			throw new Error("Optimization cancelled by user.");
+		}
 		try {
 			const execFn = (args: string[]) =>
 				pi.exec("pi", args, {
@@ -195,6 +195,9 @@ async function optimizeWithFallback(
 			const result = await optimizePrompt(text, m, execFn, threshold, systemPrompt, signal);
 			return { result, usedModel: m, isFallback: i > 0, attemptIndex: i + 1 };
 		} catch (err) {
+			if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
+				throw new Error("Optimization cancelled by user.");
+			}
 			lastError = err instanceof Error ? err : new Error(String(err));
 		}
 	}
@@ -213,11 +216,11 @@ export default function (pi: ExtensionAPI) {
 	// Optimization statistics (in-memory, per session)
 	const stats = {
 		totalOptimizations: 0,
+		appliedOptimizations: 0,
 		totalInputTokens: 0,
 		totalOutputTokens: 0,
 		totalElapsed: 0,
 		totalBudgetExceeded: 0,
-		shortResponseCount: 0,
 		fallbackUsed: 0,
 	};
 
@@ -231,13 +234,6 @@ export default function (pi: ExtensionAPI) {
 		elapsed: string;
 	} | null = null;
 
-	// Tool call counter for context pressure
-	let toolCallCount = 0;
-	const COMPACT_THRESHOLD = 30;
-
-	// Track whether last prompt was optimized (for quality feedback in agent_end)
-	let lastPromptWasOptimized = false;
-
 	// ── Animation State ───────────────────────────
 	let animTimer: ReturnType<typeof setInterval> | null = null;
 	let animFrame = 0;
@@ -246,7 +242,7 @@ export default function (pi: ExtensionAPI) {
 		if (animTimer) return;
 		animFrame = 0;
 		const step = () => {
-			ctx.ui.setStatus("tw", formatFooterShimmerFrame(config, animFrame));
+			ctx.ui.setStatus("tw", formatFooterShimmerFrame(config, animFrame, ctx.ui.theme));
 			animFrame++;
 		};
 		step();
@@ -264,9 +260,18 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Session Start: Project Context Detection ──
 	pi.on("session_start", async (_event, ctx) => {
-		toolCallCount = 0;
+		pendingOptimization = null;
+		pendingBypass = null;
 		try {
-			await detectProjectContext(process.cwd());
+			appliedTransformations = loadAppliedTransformations((ctx as any).sessionManager);
+		} catch {
+			appliedTransformations = [];
+			// Ephemeral sessions or entries without comparison records.
+		}
+		pendingCommandSkips = 0;
+		try {
+			const workspaceRoot = (ctx as { cwd?: string }).cwd ?? process.cwd();
+			await detectProjectContext(workspaceRoot);
 		} catch {
 			// Project detection failed — optimization will run without context.
 		}
@@ -282,62 +287,231 @@ export default function (pi: ExtensionAPI) {
 		animFrame = 0;
 	});
 
-	// ── Context Pressure Indicator ─────────────
-	pi.on("tool_call", async (_event, ctx) => {
-		toolCallCount++;
-		if (toolCallCount === COMPACT_THRESHOLD) {
-			ctx.ui.notify(
-				`~ ${toolCallCount} tool calls this session. Consider /compact or /clear to free up context.`,
-				"warning",
-			);
-		}
-	});
-
-	// ── Quality Feedback (agent_end) ───────────
-	pi.on("agent_end", async (event, ctx) => {
-		if (!lastPromptWasOptimized) return;
-
-		const lastMsg = event.messages[event.messages.length - 1];
-		if (!lastMsg || lastMsg.role !== "assistant") return;
-
-		const responseText =
-			typeof lastMsg.content === "string"
-				? lastMsg.content
-				: Array.isArray(lastMsg.content)
-					? lastMsg.content
-							.filter((b: any) => b.type === "text")
-							.map((b: any) => b.text)
-							.join("\n")
-					: "";
-
-		if (responseText.length < 120) {
-			stats.shortResponseCount++;
-		}
-
-		lastPromptWasOptimized = false;
-	});
-
 	// ── Message Renderer ───────────────────────
 	pi.registerMessageRenderer("twiddle", (message, _options, theme) => {
 		return new Text(theme.fg("muted", (message as any).content ?? ""), 0, 0);
 	});
 
+	// Comparison record: original vs applied text plus run metadata. Custom
+	// entries do NOT participate in LLM context, so the comparison stays
+	// visible in the session (collapsed) without polluting model context.
+	// The applied version is the single source of truth for what the agent
+	// received; the original is kept for audit and resume.
+	pi.registerEntryRenderer("twiddle-comparison", (entry, options, theme) => {
+		const data = (entry as any).data ?? {};
+		const summary = theme.fg("muted",
+			`Twiddle: ${data.scope ?? "?"} ${data.inputTokens ?? "?"}→${data.outputTokens ?? "?"} tokens · ${data.model ?? "unknown model"} · ${data.elapsed ?? "?"}s`,
+		);
+		if ((options as any)?.expanded) {
+			return new Text(
+				`${summary}\nOriginal: ${data.original ?? ""}\nApplied: ${data.applied ?? ""}`,
+				0,
+				0,
+			);
+		}
+		return new Text(summary, 0, 0);
+	});
+
+	function recordComparison(data: Record<string, unknown>): void {
+		try {
+			(pi as any).appendEntry?.("twiddle-comparison", data);
+		} catch {
+		// Ephemeral sessions or older harness without appendEntry.
+		}
+	}
+
 	// ── Commands ───────────────────────────────
 
-	pi.registerCommand("twiddle", {
-		description: "Twiddle: show current configuration",
-		handler: async (_args, ctx) => {
-			const config = await getConfig();
-			const autoStatus = config.auto ? "auto" : "manual";
-			twiddleNotify(ctx, config, "normal",
-				`Twiddle  •  ${formatModelRef(config)}  •  threshold: ${config.threshold ?? 40}%  •  timeout: ${config.timeout ?? 15}s  •  verbose: ${config.verbose ?? "normal"}  •  mode: ${autoStatus}`,
+	// Shared model picker used by /twiddle-model, the /twiddle panel, and
+	// setup. Returns true when a model was selected and saved.
+	async function pickOptimizationModel(ctx: any, config: TwiddleConfig): Promise<boolean> {
+		const all = ctx.modelRegistry.getAvailable();
+
+		if (all.length === 0) {
+			ctx.ui.notify(
+				"No models available. Configure an API key first (/login).",
+				"warning",
 			);
+			return false;
+		}
+
+		const options = all.map((m: Model<Api>) => pickModelLabel(m));
+		const choice = await searchableSelect(ctx, "Select optimization model:", options);
+
+		if (choice === undefined) return false;
+		const idx = options.indexOf(choice);
+		const selected = all[idx];
+		config.model = { provider: selected.provider, id: selected.id };
+		await writeConfig(config);
+		updateFooterStatus(ctx, config);
+		ctx.ui.notify(`Twiddle model: ${pickModelLabel(selected)}`, "info");
+		return true;
+	}
+
+	// ── Control Panel ──────────────────────────────────
+	// Single entry point for all Twiddle settings. Re-reads config every
+	// iteration so the menu never shows stale values.
+	async function runControlPanel(ctx: any): Promise<void> {
+		// Loop until user exits
+		while (true) {
+			const config = await getConfig();
+			const fallbacks = config.fallbackModels ?? [];
+			const fallbackList =
+				fallbacks.length > 0
+					? fallbacks.map((m) => `${m.provider}/${m.id}`).join(", ")
+					: "none";
+
+			const minCharsLabel = typeof config.minChars === "number"
+				? `${config.minChars} chars`
+				: "0 chars (default)";
+			const options = [
+				`Model: ${config.model ? `${config.model.provider}/${config.model.id}` : "not set"}`,
+				`Expansion limit: ${config.threshold ?? 40}%`,
+				`Timeout: ${config.timeout ?? 15}s`,
+				`Auto-mode minimum: ${minCharsLabel}`,
+				`Verbosity: ${config.verbose ?? "quiet"}`,
+				`Auto-mode: ${config.auto ? "ON" : "OFF"}`,
+				`Fallbacks: ${fallbackList}`,
+				"Exit",
+			];
+
+			const choice = await ctx.ui.select("Twiddle — select an option to change:", options);
+			if (choice === undefined || choice === "Exit") return;
+
+			const idx = options.indexOf(choice);
+
+			switch (idx) {
+				case 0: { // Model
+					const all = ctx.modelRegistry.getAvailable();
+					if (all.length === 0) {
+						ctx.ui.notify("No models available. Configure an API key first.", "warning");
+						break;
+					}
+					const modelOptions = all.map((m) => `${m.provider}/${m.id}  (${m.name})`);
+					const pick = await searchableSelect(ctx, "Select optimization model:", modelOptions);
+					if (pick !== undefined) {
+						const mi = modelOptions.indexOf(pick);
+						const selected = all[mi];
+						config.model = { provider: selected.provider, id: selected.id };
+						await writeConfig(config);
+						updateFooterStatus(ctx, config);
+					}
+					break;
+				}
+				case 1: { // Threshold
+					const val = Number.parseInt(
+						await ctx.ui.input("New threshold (0-500):") ?? "",
+						10,
+					);
+					if (!Number.isNaN(val) && val >= 0 && val <= 500) {
+						config.threshold = val;
+						await writeConfig(config);
+					}
+					break;
+				}
+				case 2: { // Timeout
+					const val = Number.parseInt(
+						await ctx.ui.input("New timeout in seconds (5-60):") ?? "",
+						10,
+					);
+					if (!Number.isNaN(val) && val >= 5 && val <= 60) {
+						config.timeout = val;
+						await writeConfig(config);
+					}
+					break;
+				}
+				case 3: { // Auto-mode minimum
+					const raw = await ctx.ui.input("Minimum prompt length for auto-mode in chars (empty = default 0):") ?? "";
+					if (raw.trim() === "") {
+						config.minChars = undefined;
+						await writeConfig(config);
+					} else {
+						const val = Number.parseInt(raw, 10);
+						if (!Number.isNaN(val) && val >= 0) {
+							config.minChars = val;
+							await writeConfig(config);
+						}
+					}
+					break;
+				}
+				case 4: { // Verbosity
+					const levels = ["quiet", "debug"];
+					const current = config.verbose ?? "quiet";
+					const next = levels[(levels.indexOf(current) + 1) % levels.length];
+					config.verbose = next as "quiet" | "debug";
+					await writeConfig(config);
+					break;
+				}
+				case 5: { // Auto-mode
+					config.auto = !config.auto;
+					await writeConfig(config);
+					updateFooterStatus(ctx, config);
+					break;
+				}
+				case 6: { // Fallbacks
+					const fbOptions = [
+						"Add fallback",
+						"Remove fallback",
+						"Clear all fallbacks",
+						"Back",
+					];
+					const fbChoice = await ctx.ui.select("Manage fallback models:", fbOptions);
+					if (fbChoice === "Add fallback") {
+						const all = ctx.modelRegistry.getAvailable();
+						if (all.length === 0) {
+							ctx.ui.notify("No models available.", "warning");
+						} else {
+							const existingRefs = new Set(fallbacks.map((m) => `${m.provider}/${m.id}`));
+							if (config.model) existingRefs.add(`${config.model.provider}/${config.model.id}`);
+							const available = all.filter((m) => !existingRefs.has(`${m.provider}/${m.id}`));
+							if (available.length === 0) {
+								ctx.ui.notify("All available models already configured.", "info");
+							} else {
+								const opts = available.map((m) => `${m.provider}/${m.id}  (${m.name})`);
+								opts.push("Cancel");
+								const pick = await searchableSelect(ctx, "Select fallback model:", opts);
+								if (pick !== undefined && pick !== "Cancel") {
+									const mi = opts.indexOf(pick);
+									const sel = available[mi];
+									fallbacks.push({ provider: sel.provider, id: sel.id });
+									config.fallbackModels = fallbacks;
+									await writeConfig(config);
+								}
+							}
+						}
+					} else if (fbChoice === "Remove fallback") {
+						if (fallbacks.length > 0) {
+							const fbLabels = fallbacks.map((m) => `${m.provider}/${m.id}`);
+							fbLabels.push("Cancel");
+							const toRemove = await searchableSelect(ctx, "Remove which fallback?", fbLabels);
+							if (toRemove && toRemove !== "Cancel") {
+								config.fallbackModels = fallbacks.filter(
+									(m) => `${m.provider}/${m.id}` !== toRemove,
+								);
+								await writeConfig(config);
+							}
+						}
+					} else if (fbChoice === "Clear all fallbacks") {
+						config.fallbackModels = [];
+						await writeConfig(config);
+					}
+					break;
+				}
+
+			}
+		}
+	}
+
+	pi.registerCommand("twiddle", {
+		description: "Twiddle: open the control panel",
+		handler: async (_args, ctx) => {
+			await runControlPanel(ctx);
 		},
 	});
 
 	pi.registerCommand("twiddle-model", {
-		description: "Twiddle: select optimization model",
-		handler: async (_args, ctx) => {
+		description: "Twiddle: select optimization model (optional filter text)",
+		handler: async (args, ctx) => {
 			const config = await getConfig();
 			const all = ctx.modelRegistry.getAvailable();
 
@@ -349,44 +523,94 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const options = all.map((m) => pickModelLabel(m));
-			const choice = await ctx.ui.select("Select optimization model:", options);
-
-			if (choice !== undefined) {
-				const idx = options.indexOf(choice);
-				const selected = all[idx];
-				config.model = { provider: selected.provider, id: selected.id };
-				await writeConfig(config);
-				updateFooterStatus(ctx, config);
-				twiddleNotify(ctx, config, "normal",
-					`Twiddle model: ${pickModelLabel(selected)}`,
-				);
+			// Optional typed filter: /twiddle-model <text> narrows the catalog
+			// by provider, id, or name before showing the selector.
+			const query = (args ?? "").trim();
+			if (query) {
+				const candidates = filterModels(all, query);
+				if (candidates.length === 0) {
+					ctx.ui.notify(`No models match "${args}".`, "info");
+					return;
+				}
+				if (candidates.length === 1) {
+					const selected = candidates[0];
+					config.model = { provider: selected.provider, id: selected.id };
+					await writeConfig(config);
+					updateFooterStatus(ctx, config);
+					ctx.ui.notify(`Twiddle model: ${pickModelLabel(selected)}`, "info");
+					return;
+				}
+				// Multiple matches: fall through to the full picker below.
+				// (Filtering the picker list itself stays a future refinement.)
 			}
+
+			await pickOptimizationModel(ctx, config);
 		},
 	});
 
 	pi.registerCommand("twiddle-threshold", {
-		description: "Twiddle: show or set token budget threshold (0–500%)",
+		description: "Twiddle: show or set max expansion of optimized text (0–500%)",
 		handler: async (args, ctx) => {
 			const config = await getConfig();
 
 			if (!args) {
-				twiddleNotify(ctx, config, "normal",
-					`Current threshold: ${config.threshold ?? 40}%. Use /twiddle-threshold <N> to change (ex: /twiddle-threshold 40).`,
+				ctx.ui.notify(
+					`Current expansion limit: ${config.threshold ?? 40}%. Optimized text longer than input + limit is discarded and the original is sent. Use /twiddle-threshold <N> to change (ex: /twiddle-threshold 40).`,
+					"info",
 				);
 				return;
 			}
 
 			const val = Number.parseInt(args, 10);
 			if (Number.isNaN(val) || val < 0 || val > 500) {
-				twiddleNotify(ctx, config, "normal", "Threshold must be between 0 and 500.", "error");
+				ctx.ui.notify("Expansion limit must be between 0 and 500.", "error");
 				return;
 			}
 			config.threshold = val;
 			await writeConfig(config);
-			twiddleNotify(ctx, config, "normal",
-				`Twiddle threshold set to ${val}% (max ${val}% over input).`,
+			ctx.ui.notify(
+				`Twiddle expansion limit set to ${val}% (optimized text may be ${val}% longer than input at most).`,
+				"info",
 			);
+		},
+	});
+
+	pi.registerCommand("twiddle-min-chars", {
+		description: "Twiddle: show or set minimum prompt length for auto-mode (chars)",
+		handler: async (args, ctx) => {
+			const config = await getConfig();
+			const current = typeof config.minChars === "number"
+				? `${config.minChars} chars`
+				: "0 chars (default — every prompt eligible)";
+
+			if (!args) {
+				ctx.ui.notify(
+					`Current auto-mode minimum: ${current}. Shorter auto-mode prompts are sent unchanged; ~ always optimizes. Use /twiddle-min-chars <N> to set, or /twiddle-min-chars off to restore the default.`,
+					"info",
+				);
+				return;
+			}
+
+			if (args.toLowerCase().trim() === "off") {
+				config.minChars = undefined;
+				await writeConfig(config);
+				ctx.ui.notify("Auto-mode minimum restored to the default (0 — every prompt eligible).", "info");
+				return;
+			}
+
+			const val = Number.parseInt(args, 10);
+			if (Number.isNaN(val) || val < 0) {
+				ctx.ui.notify("Minimum must be 0 or more characters, or off.", "error");
+				return;
+			}
+			config.minChars = val;
+			await writeConfig(config);
+			ctx.ui.notify(
+				val === 0
+					? "Auto-mode minimum disabled: length alone no longer skips optimization."
+					: `Auto-mode minimum set to ${val} chars. Shorter auto-mode prompts are sent unchanged; ~ always optimizes.`,
+				"info",
+				);
 		},
 	});
 
@@ -396,7 +620,7 @@ export default function (pi: ExtensionAPI) {
 			await writeConfig({ threshold: 40, auto: false });
 			const config = await getConfig();
 			updateFooterStatus(ctx, config);
-			twiddleNotify(ctx, config, "normal", "Twiddle config reset.");
+			ctx.ui.notify("Twiddle config reset to defaults (model and fallbacks cleared).", "info");
 		},
 	});
 
@@ -407,7 +631,7 @@ export default function (pi: ExtensionAPI) {
 			config.auto = true;
 			await writeConfig(config);
 			updateFooterStatus(ctx, config);
-			twiddleNotify(ctx, config, "normal", "auto-mode ON — all prompts optimized.");
+			ctx.ui.notify("auto-mode ON — eligible prompts are optimized.", "info");
 		},
 	});
 
@@ -418,7 +642,7 @@ export default function (pi: ExtensionAPI) {
 			config.auto = false;
 			await writeConfig(config);
 			updateFooterStatus(ctx, config);
-			twiddleNotify(ctx, config, "normal", "auto-mode OFF — use ~ prefix to optimize.");
+			ctx.ui.notify("auto-mode OFF — use ~ prefix to optimize.", "info");
 		},
 	});
 
@@ -433,27 +657,24 @@ export default function (pi: ExtensionAPI) {
 				stats.totalInputTokens > 0
 					? ((stats.totalOutputTokens / stats.totalInputTokens) * 100).toFixed(0)
 					: "0";
-			const shortNote =
-				stats.shortResponseCount > 0
-					? ` · ${stats.shortResponseCount} respostas curtas`
-					: "";
 			const fallbackNote =
 				stats.fallbackUsed > 0
 					? ` · ${stats.fallbackUsed} via fallback`
 					: "";
-			const summary = `Twiddle Report: ${stats.totalOptimizations} ops · ` +
-				`${stats.totalInputTokens}→${stats.totalOutputTokens} tokens ` +
+			const summary = `Twiddle Report: ${stats.totalOptimizations} attempts · ` +
+				`${stats.appliedOptimizations} applied · ` +
+				`${stats.totalBudgetExceeded} rejected over expansion limit · ` +
+				`~${stats.totalInputTokens}→~${stats.totalOutputTokens} est. tokens ` +
 				`(avg ${avgRatio}%) · ` +
-				`${stats.totalBudgetExceeded} exceeded budget · ` +
 				`${stats.totalElapsed.toFixed(0)}s total` +
-				shortNote + fallbackNote;
+				fallbackNote;
 			ctx.ui.notify(summary, "info");
 
 			// Show last optimization preview
 			if (lastOptimization) {
 				const lo = lastOptimization;
 				const intentLabel = lo.intent ? ` | 🎯 ${lo.intent}` : "";
-				const header = `Última: 📐 ${lo.scope}${intentLabel} | 🧾 ${lo.inputTokens}→${lo.outputTokens} tokens ⏳ ${lo.elapsed}s`;
+				const header = `Last applied: 📐 ${lo.scope}${intentLabel} | 🧾 ~${lo.inputTokens}→~${lo.outputTokens} est. tokens ⏳ ${lo.elapsed}s | full comparison stored in the session entry`;
 				ctx.ui.notify(header, "info");
 				ctx.ui.notify(lo.text, "info");
 			}
@@ -461,25 +682,25 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("twiddle-verbose", {
-		description: "Twiddle: set verbosity level (quiet, normal, debug)",
+		description: "Twiddle: set verbosity level (quiet, debug)",
 		handler: async (args, ctx) => {
 			const config = await getConfig();
-			const current = config.verbose ?? "normal";
+			const current = config.verbose ?? "quiet";
 
 			if (!args) {
-				ctx.ui.notify(`Current verbosity: ${current}. Use /twiddle-verbose <quiet|normal|debug>.`, "info");
+				ctx.ui.notify(`Current verbosity: ${current}. Use /twiddle-verbose <quiet|debug>.`, "info");
 				return;
 			}
 
 			const level = args.toLowerCase().trim();
-			if (level !== "quiet" && level !== "normal" && level !== "debug") {
-				ctx.ui.notify("Use: quiet, normal, or debug.", "error");
+			if (level !== "quiet" && level !== "debug") {
+				ctx.ui.notify("Use: quiet or debug.", "error");
 				return;
 			}
 
-			config.verbose = level as "quiet" | "normal" | "debug";
+			config.verbose = level as "quiet" | "debug";
 			await writeConfig(config);
-			twiddleNotify(ctx, config, "normal", `Twiddle verbosity: ${level}.`);
+			ctx.ui.notify(`Twiddle verbosity: ${level}.`, "info");
 		},
 	});
 
@@ -526,6 +747,16 @@ export default function (pi: ExtensionAPI) {
 			const parts = args.split(/\s+/);
 			const action = parts[0].toLowerCase();
 
+			if (action === "list") {
+				if (fallbacks.length === 0) {
+					ctx.ui.notify("No fallback models configured. Use /twiddle-fallback add to pick one.", "info");
+				} else {
+					const list = fallbacks.map((m, i) => `${i + 1}. ${m.provider}/${m.id}`).join(" · ");
+					ctx.ui.notify(`Fallbacks (${fallbacks.length}): ${list}`, "info");
+				}
+				return;
+			}
+
 			if (action === "clear") {
 				config.fallbackModels = [];
 				await writeConfig(config);
@@ -551,7 +782,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const options = available.map((m) => `${m.provider}/${m.id}  (${m.name})`);
 				options.push("Cancel");
-				const pick = await ctx.ui.select("Select fallback model:", options);
+				const pick = await searchableSelect(ctx, "Select fallback model:", options);
 				if (pick !== undefined && pick !== "Cancel") {
 					const idx = options.indexOf(pick);
 					const selected = available[idx];
@@ -581,162 +812,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("twiddle-setup", {
-		description: "Twiddle: interactive setup for all configuration",
-		handler: async (_args, ctx) => {
-			// Loop until user exits
-			while (true) {
-				const config = await getConfig();
-				const fallbacks = config.fallbackModels ?? [];
-				const fallbackList =
-					fallbacks.length > 0
-						? fallbacks.map((m) => `${m.provider}/${m.id}`).join(", ")
-						: "none";
-
-				const options = [
-					`Model: ${config.model ? `${config.model.provider}/${config.model.id}` : "not set"}`,
-					`Threshold: ${config.threshold ?? 40}%`,
-					`Timeout: ${config.timeout ?? 15}s`,
-					`Verbosity: ${config.verbose ?? "normal"}`,
-					`Auto-mode: ${config.auto ? "ON" : "OFF"}`,
-					`Quick model: ${config.quickModel ? `${config.quickModel.provider}/${config.quickModel.id}` : "none"}`,
-					`Fallbacks: ${fallbackList}`,
-					"Exit setup",
-				];
-
-				const choice = await ctx.ui.select("Twiddle Setup — select an option to change:", options);
-				if (choice === undefined || choice === "Exit setup") return;
-
-				const idx = options.indexOf(choice);
-
-				switch (idx) {
-					case 0: { // Model
-						const all = ctx.modelRegistry.getAvailable();
-						if (all.length === 0) {
-							ctx.ui.notify("No models available. Configure an API key first.", "warning");
-							break;
-						}
-						const modelOptions = all.map((m) => `${m.provider}/${m.id}  (${m.name})`);
-						const pick = await ctx.ui.select("Select optimization model:", modelOptions);
-						if (pick !== undefined) {
-							const mi = modelOptions.indexOf(pick);
-							const selected = all[mi];
-							config.model = { provider: selected.provider, id: selected.id };
-							await writeConfig(config);
-						}
-						break;
-					}
-					case 1: { // Threshold
-						const val = Number.parseInt(
-							await ctx.ui.input("New threshold (0-500):") ?? "",
-							10,
-						);
-						if (!Number.isNaN(val) && val >= 0 && val <= 500) {
-							config.threshold = val;
-							await writeConfig(config);
-						}
-						break;
-					}
-					case 2: { // Timeout
-						const val = Number.parseInt(
-							await ctx.ui.input("New timeout in seconds (5-60):") ?? "",
-							10,
-						);
-						if (!Number.isNaN(val) && val >= 5 && val <= 60) {
-							config.timeout = val;
-							await writeConfig(config);
-						}
-						break;
-					}
-					case 3: { // Verbosity
-						const levels = ["quiet", "normal", "debug"];
-						const current = config.verbose ?? "normal";
-						const next = levels[(levels.indexOf(current) + 1) % levels.length];
-						config.verbose = next as "quiet" | "normal" | "debug";
-						await writeConfig(config);
-						break;
-					}
-					case 4: { // Auto-mode
-						config.auto = !config.auto;
-						await writeConfig(config);
-						break;
-					}
-					case 5: { // Quick model
-						const allQuick = ctx.modelRegistry.getAvailable();
-						if (allQuick.length === 0) {
-							ctx.ui.notify("No models available.", "warning");
-						} else {
-							const opts = allQuick.map((m) => `${m.provider}/${m.id}  (${m.name})`);
-							opts.push("Clear");
-							opts.push("Cancel");
-							const pick = await ctx.ui.select("Select quick model (trivial/low prompts):", opts);
-							if (pick === "Clear") {
-								config.quickModel = undefined;
-								await writeConfig(config);
-							} else if (pick !== undefined && pick !== "Cancel") {
-								const mi = opts.indexOf(pick);
-								const sel = allQuick[mi];
-								config.quickModel = { provider: sel.provider, id: sel.id };
-								await writeConfig(config);
-							}
-						}
-						break;
-					}
-					case 6: { // Fallbacks
-						const fbOptions = [
-							"Add fallback",
-							"Remove fallback",
-							"Clear all fallbacks",
-							"Back",
-						];
-						const fbChoice = await ctx.ui.select("Manage fallback models:", fbOptions);
-						if (fbChoice === "Add fallback") {
-							const all = ctx.modelRegistry.getAvailable();
-							if (all.length === 0) {
-								ctx.ui.notify("No models available.", "warning");
-							} else {
-								const existingRefs = new Set(fallbacks.map((m) => `${m.provider}/${m.id}`));
-								if (config.model) existingRefs.add(`${config.model.provider}/${config.model.id}`);
-								const available = all.filter((m) => !existingRefs.has(`${m.provider}/${m.id}`));
-								if (available.length === 0) {
-									ctx.ui.notify("All available models already configured.", "info");
-								} else {
-									const opts = available.map((m) => `${m.provider}/${m.id}  (${m.name})`);
-									opts.push("Cancel");
-									const pick = await ctx.ui.select("Select fallback model:", opts);
-									if (pick !== undefined && pick !== "Cancel") {
-										const mi = opts.indexOf(pick);
-										const sel = available[mi];
-										fallbacks.push({ provider: sel.provider, id: sel.id });
-										config.fallbackModels = fallbacks;
-										await writeConfig(config);
-									}
-								}
-							}
-						} else if (fbChoice === "Remove fallback") {
-							if (fallbacks.length > 0) {
-								const fbLabels = fallbacks.map((m) => `${m.provider}/${m.id}`);
-								fbLabels.push("Cancel");
-								const toRemove = await ctx.ui.select("Remove which fallback?", fbLabels);
-								if (toRemove && toRemove !== "Cancel") {
-									config.fallbackModels = fallbacks.filter(
-										(m) => `${m.provider}/${m.id}` !== toRemove,
-									);
-									await writeConfig(config);
-								}
-							}
-						} else if (fbChoice === "Clear all fallbacks") {
-							config.fallbackModels = [];
-							await writeConfig(config);
-						}
-						break;
-					}
-
-				}
-			}
-		},
-	});
-
 	// ── Shared Optimization Core ──────────────
 	// Common logic for both the input event (commands) and the context event
 	// (plain prompts). Callers handle UI output and message transformation.
@@ -746,7 +821,6 @@ export default function (pi: ExtensionAPI) {
 		forcedIntent?: IntentCategory;
 		model: { provider: string; id: string };
 		fallbackModels?: Array<{ provider: string; id: string }>;
-		quickModel?: { provider: string; id: string };
 		threshold: number;
 		timeoutSeconds: number;
 		startTime: number;
@@ -765,7 +839,8 @@ export default function (pi: ExtensionAPI) {
 		config: TwiddleConfig,
 	): Promise<OptimizationCoreResult> {
 		const intent = req.forcedIntent ?? detectIntent(req.effectiveText);
-		const projectContext = getCachedContext();
+		const workspaceRoot = (ctx as { cwd?: string }).cwd ?? process.cwd();
+		const projectContext = getCachedContext(workspaceRoot);
 		const thinkingLevel = pi.getThinkingLevel();
 		const scope = detectScope(req.effectiveText);
 		const systemPrompt = buildSystemPrompt({
@@ -775,6 +850,8 @@ export default function (pi: ExtensionAPI) {
 			scope,
 		});
 
+		// Count request before provider execution so exhausted chains remain visible.
+		stats.totalOptimizations++;
 		startTwiddleAnim(ctx, config);
 		const fr = await optimizeWithFallback(
 			req.effectiveText,
@@ -784,29 +861,31 @@ export default function (pi: ExtensionAPI) {
 			req.threshold,
 			systemPrompt,
 			req.timeoutSeconds,
-			scope,
-			req.quickModel,
 			ctx.signal ?? undefined,
 		);
 		stopTwiddleAnim(ctx, config);
 
 		const elapsed = ((Date.now() - req.startTime) / 1000).toFixed(1);
-		lastPromptWasOptimized = true;
 
-		stats.totalOptimizations++;
 		stats.totalInputTokens += fr.result.inputTokens;
 		stats.totalOutputTokens += fr.result.outputTokens;
 		stats.totalElapsed += parseFloat(elapsed);
-		if (fr.result.exceedsBudget) stats.totalBudgetExceeded++;
-		if (fr.isFallback) stats.fallbackUsed++;
-		lastOptimization = {
-			text: fr.result.optimizedText,
-			intent,
-			scope,
-			inputTokens: fr.result.inputTokens,
-			outputTokens: fr.result.outputTokens,
-			elapsed,
-		};
+		if (fr.isFallback) {
+			stats.fallbackUsed++;
+		}
+		if (fr.result.exceedsBudget) {
+			stats.totalBudgetExceeded++;
+		} else {
+			stats.appliedOptimizations++;
+			lastOptimization = {
+				text: fr.result.optimizedText,
+				intent,
+				scope,
+				inputTokens: fr.result.inputTokens,
+				outputTokens: fr.result.outputTokens,
+				elapsed,
+			};
+		}
 
 		return { fr, elapsed, intent, scope };
 	}
@@ -822,10 +901,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ── State ──────────────────────────────────
-	// Flag para evitar dupla otimização: quando o input event já processou
-	// um comando (/skill ~texto), before_agent_start deve pular.
-	// Também usada em auto-mode para proteger comandos sem ~.
-	let skipAgentOptimization = false;
+	// Number of command inputs awaiting before_agent_start. A counter avoids
+	// stale boolean state when several prompts are queued during streaming.
+	let pendingCommandSkips = 0;
 	let missingModelSetupSilencedForSession = false;
 
 	async function ensureModelConfigured(text: string, ctx: any, config: TwiddleConfig): Promise<boolean> {
@@ -839,19 +917,19 @@ export default function (pi: ExtensionAPI) {
 		const models = ctx.modelRegistry.getAvailable();
 		if (models.length === 0) {
 			missingModelSetupSilencedForSession = true;
-			twiddleNotify(ctx, config, "normal",
+			twiddleNotify(ctx, config, "debug",
 				"Twiddle: no models available. Configure an API key first. Prompts will be sent unchanged this session.",
 				"warning",
 			);
 			return false;
 		}
 
-		const options = models.map((model: Model) => pickModelLabel(model));
+		const options = models.map((model: Model<Api>) => pickModelLabel(model));
 		options.push("Cancel");
-		const choice = await ctx.ui.select("Twiddle needs an optimization model:", options);
+		const choice = await searchableSelect(ctx, "Twiddle needs an optimization model:", options);
 		if (choice === undefined || choice === "Cancel") {
 			missingModelSetupSilencedForSession = true;
-			twiddleNotify(ctx, config, "normal",
+			twiddleNotify(ctx, config, "debug",
 				"Twiddle: no model selected. Prompts will be sent unchanged this session. Use /twiddle-model to enable optimization.",
 				"warning",
 			);
@@ -862,7 +940,7 @@ export default function (pi: ExtensionAPI) {
 		config.model = { provider: selected.provider, id: selected.id };
 		await writeConfig(config);
 		updateFooterStatus(ctx, config);
-		twiddleNotify(ctx, config, "normal", `Twiddle model: ${pickModelLabel(selected)}`);
+		twiddleNotify(ctx, config, "debug", `Twiddle model: ${pickModelLabel(selected)}`);
 		return true;
 	}
 
@@ -878,54 +956,47 @@ export default function (pi: ExtensionAPI) {
 		const tildeIdx = text.indexOf(" ~");
 
 		if (tildeIdx === -1) {
-			// Comando sem ~: em auto-mode, protege de otimização dupla
-			if (config.auto) {
-				skipAgentOptimization = true;
-			}
-			return; // continue — passa intacto
+			// Command prompts must not be auto-optimized after skill/template expansion.
+			if (config.auto) pendingCommandSkips++;
+			return; // continue — passes through intact
 		}
 
-		// Comando com ~: extrai, otimiza, reconstroi
+		// Parse control syntax before model setup so raw bypasses remain usable
+		// even when no optimization model is configured.
 		const commandPrefix = text.slice(0, tildeIdx).trimEnd();
 		const rawText = text.slice(tildeIdx + 2).trim();
 		if (!rawText) return;
-
-		const hasModel = await ensureModelConfigured(text, ctx, config);
-		if (!hasModel || !config.model) {
-			skipAgentOptimization = true;
-			return;
+		const parsed = parseOverride(rawText);
+		const effectiveText = parsed.text;
+		if (parsed.skipOptimization) {
+			pendingCommandSkips++;
+			return { action: "transform", text: `${commandPrefix} ${effectiveText}` };
 		}
 
-		skipAgentOptimization = true;
+		pendingCommandSkips++;
+		const hasModel = await ensureModelConfigured(text, ctx, config);
+		if (!hasModel || !config.model) return;
+
 		const startTime = Date.now();
 
 		try {
-			const parsed = parseOverride(rawText);
-			const effectiveText = parsed.text;
-
-			if (parsed.skipOptimization) {
-				return { action: "transform", text: `${commandPrefix} ${effectiveText}` };
-			}
-
 			const { fr, elapsed } = await runOptimizationCore({
 				effectiveText,
 				forcedIntent: parsed.intent,
 				model: config.model,
 				fallbackModels: config.fallbackModels,
-				quickModel: config.quickModel,
 				threshold: config.threshold ?? 40,
 				timeoutSeconds: config.timeout ?? 15,
 				startTime,
 			}, ctx, config);
 
-			const verbose = config.verbose ?? "normal";
+			const verbose = config.verbose ?? "quiet";
 			if (!parsed.quiet && verbose !== "quiet") {
 				const totalModels = 1 + (config.fallbackModels?.length ?? 0);
-				pi.sendMessage({
-					customType: "twiddle",
-					content: `Twiddle~ 🧠 ${fr.usedModel.provider}/${fr.usedModel.id} 🧩 ${fr.result.inputTokens}->${fr.result.outputTokens} ⏳ ${elapsed}s - try ${fr.attemptIndex}/${totalModels}`,
-					display: true,
-				});
+				ctx.ui.notify(
+					`Twiddle~ 🧠 ${fr.usedModel.provider}/${fr.usedModel.id} 🧩 ${fr.result.inputTokens}->${fr.result.outputTokens} ⏳ ${elapsed}s - try ${fr.attemptIndex}/${totalModels}`,
+					"info",
+				);
 			}
 
 			if (fr.result.exceedsBudget) {
@@ -933,20 +1004,30 @@ export default function (pi: ExtensionAPI) {
 					`Twiddle: optimization exceeded budget (${fr.result.inputTokens} → ${fr.result.outputTokens}). Sending original.`,
 					"warning",
 				);
-				return;
+				// Still strip the control syntax so the agent never sees `~`.
+				return { action: "transform", text: `${commandPrefix} ${effectiveText}` };
 			}
 
+			if (!parsed.quiet && verbose === "debug") {
+				ctx.ui.notify(fr.result.optimizedText, "info");
+			}
+
+			recordComparison({
+				original: text,
+				applied: `${commandPrefix} ${fr.result.optimizedText}`,
+				model: `${fr.usedModel.provider}/${fr.usedModel.id}`,
+				inputTokens: fr.result.inputTokens,
+				outputTokens: fr.result.outputTokens,
+				elapsed,
+				scope: detectScope(effectiveText),
+				exceedsBudget: fr.result.exceedsBudget,
+			});
 			return { action: "transform", text: `${commandPrefix} ${fr.result.optimizedText}` };
 		} catch (err) {
-			skipAgentOptimization = false;
 			const message = err instanceof Error ? err.message : String(err);
 			const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+			stats.totalElapsed += parseFloat(elapsed);
 			stopTwiddleAnim(ctx, config);
-			pi.sendMessage({
-				customType: "twiddle",
-				content: `Twiddle~ ⚠️ ${buildModelChain(config.model, config.fallbackModels)} | all failed in ${elapsed}s | ${message}`,
-				display: true,
-			});
 			twiddleNotify(ctx, config, "quiet", `Twiddle: error — sending original. ${message}`, "warning");
 			return;
 		}
@@ -960,7 +1041,6 @@ export default function (pi: ExtensionAPI) {
 		effectiveText: string;
 		model: { provider: string; id: string };
 		fallbackModels?: Array<{ provider: string; id: string }>;
-		quickModel?: { provider: string; id: string };
 		startTime: number;
 		threshold: number;
 		mode: "auto" | "~";
@@ -970,11 +1050,17 @@ export default function (pi: ExtensionAPI) {
 		timeoutSeconds?: number;
 	} | null = null;
 
+	// Bypass without LLM: strip Twiddle control syntax and forward clean text.
+	let pendingBypass: { rawPrompt: string; stripped: string } | null = null;
+
+	// Context events transform copies. Keep every applied mapping so subsequent
+	// model calls and resumed sessions see the same text for every user message.
+	let appliedTransformations: AppliedTransformation[] = [];
+
 	pi.on("before_agent_start", async (event, ctx) => {
-		// Se o input event já processou o prompt (comando com ~)
-		// ou protegeu (auto-mode + comando sem ~), pula otimização.
-		if (skipAgentOptimization) {
-			skipAgentOptimization = false; // reset
+		// Input event already handled a command (or protected it from auto-mode).
+		if (pendingCommandSkips > 0) {
+			pendingCommandSkips--;
 			return;
 		}
 
@@ -991,17 +1077,19 @@ export default function (pi: ExtensionAPI) {
 		const rawPrompt = hasPrefix ? trimmed.slice(1).trim() : trimmed;
 		if (!rawPrompt) return;
 
-		// Auto-mode: skip trivial prompts (<5 words, not a command)
+		// Auto-mode length filter (plain prompts only; `~` always bypasses it).
+		// Default minimum is 0: every auto-mode prompt is eligible.
 		if (config.auto && !hasPrefix) {
-			const scope = detectScope(rawPrompt);
-			const wordCount = rawPrompt.split(/\s+/).length;
-			if (scope === "trivial" && wordCount < 5) return;
+			const minChars = config.minChars ?? 0;
+			if (minChars > 0 && rawPrompt.length < minChars) return;
 		}
 
 		// Parse override prefixes (~raw:, ~bug:, ~~, etc.)
 		const parsed = parseOverride(rawPrompt);
 		if (parsed.skipOptimization) {
-			// ~raw: skip optimization entirely
+			// ~raw: skip the LLM call but still strip the control syntax so
+			// the agent never sees `~raw:` / `~.` prefixes.
+			pendingBypass = { rawPrompt: trimmed, stripped: parsed.text };
 			return;
 		}
 
@@ -1015,29 +1103,46 @@ export default function (pi: ExtensionAPI) {
 			effectiveText: parsed.text,
 			model: config.model,
 			fallbackModels: config.fallbackModels,
-			quickModel: config.quickModel,
 			startTime: Date.now(),
 			threshold: config.threshold ?? 40,
 			mode,
 			forcedIntent: parsed.intent,
 			quiet: parsed.quiet,
-			verbose: config.verbose ?? "normal",
+			verbose: config.verbose ?? "quiet",
 			timeoutSeconds: config.timeout ?? 15,
 		};
 	});
 
 	pi.on("context", async (event, ctx) => {
-		if (!pendingOptimization) return;
+		if (pendingBypass) {
+			const { stripped } = pendingBypass;
+			pendingBypass = null;
+			const messages = [...event.messages];
+			applyKnownTransformations(messages, appliedTransformations, true);
+			let userMsgIdx = -1;
+			for (let i = messages.length - 1; i >= 0; i--) {
+				if (messages[i].role === "user") {
+					userMsgIdx = i;
+					break;
+				}
+			}
+			if (userMsgIdx >= 0) {
+				const signature = messageSignature(messages[userMsgIdx]);
+				messages[userMsgIdx] = applyTextToUserMessage(messages[userMsgIdx], stripped) as never;
+				if (signature !== null) {
+					appliedTransformations.push({ original: signature, applied: stripped });
+				}
+			}
+			return { messages };
+		}
 
+		if (pendingOptimization) {
 		const {
-			rawPrompt,
 			effectiveText,
 			model: modelRef,
 			fallbackModels,
-			quickModel,
 			startTime,
 			threshold,
-			mode,
 			forcedIntent,
 			quiet,
 			verbose,
@@ -1046,20 +1151,20 @@ export default function (pi: ExtensionAPI) {
 		pendingOptimization = null;
 
 		const config = await getConfig();
+		const messages = [...event.messages];
+		applyKnownTransformations(messages, appliedTransformations, true);
 
 		try {
-			const { fr, elapsed } = await runOptimizationCore({
+			const { fr, elapsed, intent, scope } = await runOptimizationCore({
 				effectiveText,
 				forcedIntent,
 				model: modelRef,
 				fallbackModels,
-				quickModel,
 				threshold,
 				timeoutSeconds: timeoutSeconds ?? 15,
 				startTime,
 			}, ctx, config);
 
-			const messages = [...event.messages];
 			let userMsgIdx = -1;
 			for (let i = messages.length - 1; i >= 0; i--) {
 				if (messages[i].role === "user") {
@@ -1069,17 +1174,25 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!fr.result.exceedsBudget && userMsgIdx >= 0) {
-				const msg = messages[userMsgIdx];
-				if (typeof msg.content === "string") {
-					messages[userMsgIdx] = { ...msg, content: fr.result.optimizedText };
-				} else if (Array.isArray(msg.content)) {
-					const newContent = msg.content.map((block) =>
-						block.type === "text"
-							? { ...block, text: fr.result.optimizedText }
-							: block,
-					);
-					messages[userMsgIdx] = { ...msg, content: newContent };
+				const signature = messageSignature(messages[userMsgIdx]);
+				messages[userMsgIdx] = applyTextToUserMessage(
+					messages[userMsgIdx],
+					fr.result.optimizedText,
+				) as never;
+				if (signature !== null) {
+					appliedTransformations.push({ original: signature, applied: fr.result.optimizedText });
 				}
+				recordComparison({
+					original: signature ?? effectiveText,
+					applied: fr.result.optimizedText,
+					model: `${fr.usedModel.provider}/${fr.usedModel.id}`,
+					inputTokens: fr.result.inputTokens,
+					outputTokens: fr.result.outputTokens,
+					elapsed,
+					intent: intent ?? null,
+					scope,
+					exceedsBudget: false,
+				});
 			}
 
 			if (!quiet && verbose !== "quiet") {
@@ -1089,14 +1202,26 @@ export default function (pi: ExtensionAPI) {
 					"info",
 				);
 			}
+			if (!quiet && verbose === "debug" && !fr.result.exceedsBudget) {
+				ctx.ui.notify(fr.result.optimizedText, "info");
+			}
 
 			return { messages };
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+			stats.totalElapsed += parseFloat(elapsed);
 			stopTwiddleAnim(ctx, config);
 			ctx.ui.notify(`⚠️ Twiddle: ${buildModelChain(modelRef, fallbackModels)} | all failed in ${elapsed}s | ${message}`, "warning");
-			return { messages: event.messages };
+			return { messages };
 		}
+		}
+
+		if (appliedTransformations.length > 0) {
+			const messages = [...event.messages];
+			applyKnownTransformations(messages, appliedTransformations, false);
+			return { messages };
+		}
+		return;
 	});
 }

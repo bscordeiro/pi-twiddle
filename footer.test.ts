@@ -31,4 +31,17 @@ describe("formatFooterShimmerFrame", () => {
 			formatFooterShimmerFrame({ auto: false }, 2),
 		);
 	});
+
+	it("uses theme colors instead of fixed ANSI when a theme is given", () => {
+		const calls: string[] = [];
+		const theme = { fg: (color: string, text: string) => {
+			calls.push(color);
+			return `<${color}>${text}</>`;
+		} };
+		const frame = formatFooterShimmerFrame({ auto: false }, 1, theme);
+		expect(frame).not.toContain("\x1b[97m");
+		expect(frame).toContain("<accent>");
+		expect(frame).toContain("T");
+		expect(calls).toContain("accent");
+	});
 });

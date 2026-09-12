@@ -1,6 +1,6 @@
 {
   "name": "pi-twiddle",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "private": false,
   "type": "module",
   "description": "Prompt distillation extension for pi.",
@@ -13,11 +13,14 @@
     "config.ts",
     "footer.ts",
     "intent.ts",
+    "models.ts",
+    "picker.ts",
     "optimizer.ts",
     "preserve.ts",
     "project.ts",
     "tokenizer.ts",
     "missing-model-warning.ts",
+    "history.ts",
     "assets/icon.png",
     "assets/prompt-report.png",
     "assets/settings.png",
@@ -33,6 +36,11 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@types/node": "^26.0.0",

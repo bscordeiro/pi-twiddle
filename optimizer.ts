@@ -6,6 +6,9 @@
  * System prompt is now composed dynamically from base + intent adendos
  * + project context + scope directives + thinking-level hints.
  */
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { countTokens } from "./tokenizer";
 import { extractProtectedFragments, restoreFragments } from "./preserve";
 import type { IntentCategory } from "./intent";
@@ -76,8 +79,7 @@ const INTENT_ADENDOS: Record<IntentCategory, string> = {
 
 	new_feature: `
 ## New Feature Mode
-- Structure the request with clear acceptance criteria.
-- Include scope boundaries (what to build, what NOT to build).
+- Reuse acceptance criteria and scope boundaries already present in the input; never invent new ones.
 - Reference existing patterns, conventions, or similar components if mentioned.
 - Keep implementation details; remove speculative design.`,
 
@@ -97,21 +99,20 @@ const INTENT_ADENDOS: Record<IntentCategory, string> = {
 
 	testing: `
 ## Testing Mode
-- Structure to include test types (unit, integration, e2e).
-- Emphasize coverage targets and edge cases.
+- Reuse test types, coverage targets, and edge cases already present in the input; never invent new ones.
 - Include mocking/stubbing requirements if mentioned.
 - Preserve framework-specific testing terminology.`,
 
 	review: `
 ## Review Mode
 - Structure for code review context (what changed, what to check).
-- Include review focus areas (security, performance, correctness).
+- Reuse review focus areas only when mentioned in the input; never invent new ones.
 - Preserve file paths and diff references.`,
 
 	docs: `
 ## Documentation Mode
 - Structure for documentation updates (what to document, target audience).
-- Include format requirements (README, API docs, ADR).
+- Reuse format requirements only when mentioned in the input (README, API docs, ADR).
 - Preserve technical accuracy over conciseness.`,
 
 	infrastructure: `
@@ -124,7 +125,7 @@ const INTENT_ADENDOS: Record<IntentCategory, string> = {
 ## Design Mode
 - Structure for architectural reasoning (trade-offs, constraints, alternatives).
 - Preserve technical depth — this is NOT a code generation task.
-- Include non-functional requirements (scalability, latency, security).`,
+- Reuse non-functional requirements only when mentioned in the input (scalability, latency, security).`,
 };
 
 // ──────────────────────────────────────────────
@@ -255,13 +256,34 @@ export interface ExecResult {
 
 type ExecFn = (args: string[]) => Promise<ExecResult>;
 
+const MAX_INLINE_PROMPT_BYTES = 64 * 1024;
+
+async function executeWithPromptTransport(
+	taggedInput: string,
+	buildArgs: (promptArg: string) => string[],
+	execFn: ExecFn,
+): Promise<ExecResult> {
+	if (Buffer.byteLength(taggedInput, "utf8") <= MAX_INLINE_PROMPT_BYTES) {
+		return execFn(buildArgs(taggedInput));
+	}
+
+	const directory = await mkdtemp(join(tmpdir(), "pi-twiddle-"));
+	const promptPath = join(directory, "prompt.txt");
+	try {
+		await writeFile(promptPath, taggedInput, { encoding: "utf8", mode: 0o600 });
+		return await execFn(buildArgs(`@${promptPath}`));
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+}
+
 /**
  * Optimize a prompt by running pi as a subprocess with the optimization system prompt.
  *
  * @param rawText - The user's raw prompt (without the ~ prefix)
  * @param modelRef - Provider and model ID to use for optimization
  * @param execFn - Function to execute pi (e.g., pi.exec, or any compatible wrapper)
- * @param thresholdPercent - Token budget threshold (default: 40%)
+ * @param thresholdPercent - Max expansion over input length in percent (default: 40%)
  * @param systemPrompt - Custom system prompt (default: BASE_SYSTEM_PROMPT)
  * @param signal - Optional AbortSignal
  */
@@ -275,7 +297,7 @@ export async function optimizePrompt(
 ): Promise<OptimizationResult> {
 	const inputTokens = countTokens(rawText);
 
-	// Token Budget Guard: check input BEFORE calling the model.
+	// Input size guard: check input BEFORE calling the model.
 	// If the raw prompt exceeds 70% of a typical context window (~128K),
 	// skip optimization — the model will likely fail or produce garbage.
 	// Return gracefully so callers handle it as a budget exceed (not an error).
@@ -299,7 +321,7 @@ export async function optimizePrompt(
 
 	// Step 3: Build pi subprocess command with minimal overhead flags.
 	const finalPrompt = systemPrompt ?? BASE_SYSTEM_PROMPT;
-	const piArgs = [
+	const buildArgs = (promptArg: string) => [
 		"-p",
 		"--no-tools",
 		"--no-session",
@@ -312,10 +334,10 @@ export async function optimizePrompt(
 		"off",
 		"--system-prompt",
 		finalPrompt,
-		taggedInput,
+		promptArg,
 	];
 
-	const result = await execFn(piArgs);
+	const result = await executeWithPromptTransport(taggedInput, buildArgs, execFn);
 
 	// Step 4: Validate subprocess
 	if (result.code !== 0 || result.killed) {
@@ -340,10 +362,33 @@ export async function optimizePrompt(
 		throw new Error("Optimization returned empty content");
 	}
 
+	// Step 4b: Verify protected-fragment integrity before restoring.
+	// The model must return every {{PRESERVE_N}} placeholder exactly once:
+	// a dropped, duplicated, or invented placeholder means code, URLs, or
+	// versions would be lost or corrupted, so refuse the output and let
+	// callers fall back to the original prompt (possibly via next model).
+	const expectedPlaceholders = [...sanitized.matchAll(/\{\{PRESERVE_(\d+)\}\}/g)].map((m) => m[1]);
+	const actualPlaceholders = [...optimizedRaw.matchAll(/\{\{PRESERVE_(\d+)\}\}/g)].map((m) => m[1]);
+	const countPlaceholders = (ids: string[]): Map<string, number> => {
+		const counts = new Map<string, number>();
+		for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1);
+		return counts;
+	};
+	const expectedCounts = countPlaceholders(expectedPlaceholders);
+	const actualCounts = countPlaceholders(actualPlaceholders);
+	const placeholdersIntact =
+		expectedCounts.size === actualCounts.size &&
+		[...expectedCounts.entries()].every(([id, count]) => actualCounts.get(id) === count);
+	if (!placeholdersIntact) {
+		throw new Error(
+			"Optimization dropped or altered protected fragments (code, URLs, versions). Sending original.",
+		);
+	}
+
 	// Step 5: Restore protected fragments
 	const optimizedText = restoreFragments(optimizedRaw, fragments);
 
-	// Step 6: Check token budget (configurable threshold)
+	// Step 6: Check expansion limit (configurable threshold)
 	const outputTokens = countTokens(optimizedText);
 	const exceedsBudget =
 		outputTokens > Math.ceil(inputTokens * (1 + thresholdPercent / 100));

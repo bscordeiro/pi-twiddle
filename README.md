@@ -17,8 +17,10 @@
 - Classifies intent with fast regex rules
 - Injects project context when useful
 - Preserves code blocks, inline code, URLs, hashes, and semver
-- Falls back through a model chain on timeout
-- Skips optimization if output would exceed token budget
+- Refuses outputs that drop, duplicate, or invent protected fragments
+- Falls back through a model chain on failure (never on explicit cancel)
+- Skips optimization if output would exceed the expansion limit
+- Stores each applied transformation as a session entry (original vs applied) without polluting model context
 
 ## Quick Start
 
@@ -31,7 +33,7 @@
 
 If no optimization model is configured yet, Twiddle offers the available models once per session. Selecting a model saves it and continues optimization; canceling sends prompts unchanged for the rest of the session.
 
-Default token budget threshold is 40%.
+Default expansion limit is 40%: optimized text longer than input + 40% is discarded and the original is sent.
 
 ## Activation
 
@@ -51,7 +53,7 @@ Default token budget threshold is 40%.
 | `~infra:text` | Force `infrastructure` |
 | `~design:text` | Force `design` |
 
-**Auto-mode** (`/twiddle-auto-on`): every prompt gets distilled, unless it is a trivial greeting.
+**Auto-mode** (`/twiddle-auto-on`): every prompt gets distilled. The default minimum is 0, so every auto-mode prompt is eligible; `/twiddle-min-chars <N>` sets a character minimum that skips shorter prompts. `~` always optimizes, regardless of length.
 
 ## Footer
 
@@ -66,17 +68,17 @@ While optimization is running, Twiddle uses a subtle shimmer over the name. The 
 
 | Command | Purpose |
 |---|---|
-| `/twiddle` | Show current config |
-| `/twiddle-model` | Select optimization model |
-| `/twiddle-threshold` [0–500] | Set token budget margin |
+| `/twiddle` | Open the control panel (model, fallbacks, limits, verbosity, auto-mode) |
+| `/twiddle-model` [filter] | Select optimization model in a searchable list (type to filter) |
+| `/twiddle-min-chars` [N\|off] | Show or set minimum prompt length for auto-mode |
+| `/twiddle-threshold` [0–500] | Show or set max expansion of optimized text |
 | `/twiddle-timeout` [5–60] | Set per-model timeout in seconds |
 | `/twiddle-fallback` add\|remove\|list\|clear | Manage fallback chain |
-| `/twiddle-verbose` quiet\|normal\|debug | Set notification verbosity |
+| `/twiddle-verbose` quiet\|debug | Set notification verbosity |
 | `/twiddle-auto-on` | Enable auto-mode |
 | `/twiddle-auto-off` | Disable auto-mode |
-| `/twiddle-report` | Show session stats |
-| `/twiddle-setup` | Interactive setup |
-| `/twiddle-reset` | Restore defaults |
+| `/twiddle-report` | Show session stats (attempts, applied, rejected) |
+| `/twiddle-reset` | Restore defaults (clears model and fallbacks) |
 
 ## Screenshots
 
@@ -93,9 +95,14 @@ While optimization is running, Twiddle uses a subtle shimmer over the name. The 
 1. Detect `~` input and parse override prefixes
 2. Classify intent and scope
 3. Inject project context when available
-4. Optimize via a separate `pi` subprocess
-5. Restore preserved fragments
-6. Keep original prompt if optimization misses budget or fails
+4. Optimize via separate `pi` subprocess; oversized prompts use temporary `@file` transport and are removed after execution
+5. Verify every protected placeholder survived exactly once, then restore fragments
+6. Keep original prompt if optimization is cancelled, misses expansion limit, or fails
+7. Record comparison (original vs applied) as session entry; restore only active branch and reapply every transformed user message consistently across model calls
+
+## Privacy
+
+Each applied optimization stores original and optimized text in session file as collapsed `twiddle-comparison` entry (outside model context). Resume, branch, export (`/export`), and share (`/share`) include these records. Config is validated before use and written atomically. Avoid pasting secrets you would not keep in history.
 
 ## Project layout
 
@@ -104,11 +111,14 @@ pi-twiddle/
 ├── index.ts
 ├── optimizer.ts
 ├── intent.ts
+├── models.ts
+├── picker.ts
 ├── project.ts
 ├── preserve.ts
 ├── tokenizer.ts
 ├── footer.ts
 ├── missing-model-warning.ts
+├── history.ts
 ├── config.ts
 ├── README.md
 ├── package.json

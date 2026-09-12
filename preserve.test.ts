@@ -53,6 +53,13 @@ describe("extractProtectedFragments", () => {
 		expect(fragments.size).toBe(1);
 	});
 
+	it("protects literal placeholder syntax from colliding with generated markers", () => {
+		const input = "Keep {{PRESERVE_1}} and `fn()` unchanged.";
+		const { sanitized, fragments } = extractProtectedFragments(input);
+		expect(restoreFragments(sanitized, fragments)).toBe(input);
+		expect(fragments.size).toBe(2);
+	});
+
 	it("leaves plain text untouched", () => {
 		const input = "Just a plain sentence here.";
 		const { sanitized, fragments } = extractProtectedFragments(input);

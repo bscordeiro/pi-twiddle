@@ -1,37 +1,20 @@
 /**
  * Project context detection via filesystem scan.
- * Runs ONCE at session_start — caches in memory.
- * Zero latency for subsequent optimizations.
- *
- * Detects: language, runtime, framework, package manager, project type.
- * Mirrors Prompt-Optimizer Phase 0 (Project Detection).
+ * Results are cached per workspace root for the current process.
  */
 import { readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 export interface ProjectContext {
-	/** Primary programming language */
 	language: string;
-	/** Runtime (e.g., "node", "bun", "deno", "go", "python", "jvm") */
 	runtime?: string;
-	/** Framework (e.g., "next.js", "react", "django", "spring boot") */
 	framework?: string;
-	/** Package manager (e.g., "npm", "pnpm", "yarn", "cargo", "pip") */
 	packageManager?: string;
-	/** Project type */
 	type: "single" | "monorepo";
 }
 
-// ──────────────────────────────────────────────
-//  Cache — populated once at session_start
-// ──────────────────────────────────────────────
-
-let cachedContext: ProjectContext | null = null;
-let detectionAttempted = false;
-
-// ──────────────────────────────────────────────
-//  Detection helpers
-// ──────────────────────────────────────────────
+const contextCache = new Map<string, ProjectContext | null>();
+let lastWorkspaceRoot: string | undefined;
 
 interface PackageJson {
 	workspaces?: string[];
@@ -42,8 +25,7 @@ interface PackageJson {
 
 async function readJSON<T>(filePath: string): Promise<T | null> {
 	try {
-		const raw = await readFile(filePath, "utf-8");
-		return JSON.parse(raw) as T;
+		return JSON.parse(await readFile(filePath, "utf-8")) as T;
 	} catch {
 		return null;
 	}
@@ -58,200 +40,95 @@ async function fileExists(filePath: string): Promise<boolean> {
 	}
 }
 
-function detectFrameworkFromDeps(
-	deps: Record<string, string> | undefined,
-): string | undefined {
+function detectFrameworkFromDeps(deps: Record<string, string> | undefined): string | undefined {
 	if (!deps) return undefined;
-
 	const frameworkMap: Array<[string, string]> = [
-		["next", "Next.js"],
-		["@angular/core", "Angular"],
-		["nuxt", "Nuxt"],
-		["svelte", "Svelte"],
-		["vue", "Vue"],
-		["react", "React"],
-		["express", "Express"],
-		["fastify", "Fastify"],
-		["nestjs", "NestJS"],
-		["django", "Django"],
-		["flask", "Flask"],
-		["spring-boot", "Spring Boot"],
-		["quarkus", "Quarkus"],
-		["rails", "Rails"],
-		["laravel", "Laravel"],
+		["next", "Next.js"], ["@angular/core", "Angular"], ["nuxt", "Nuxt"],
+		["svelte", "Svelte"], ["vue", "Vue"], ["react", "React"],
+		["express", "Express"], ["fastify", "Fastify"], ["nestjs", "NestJS"],
+		["django", "Django"], ["flask", "Flask"], ["spring-boot", "Spring Boot"],
+		["quarkus", "Quarkus"], ["rails", "Rails"], ["laravel", "Laravel"],
 	];
-
 	for (const [pkg, name] of frameworkMap) {
 		if (pkg in deps) return name;
 	}
-
 	return undefined;
 }
 
 function detectPackageManager(pkg: PackageJson): string | undefined {
-	if (pkg.packageManager) {
-		return pkg.packageManager.split("@")[0];
-	}
-	return undefined;
+	return pkg.packageManager?.split("@")[0];
 }
 
 function isMonorepo(pkg: PackageJson): boolean {
-	return !!(pkg.workspaces && pkg.workspaces.length > 0);
+	return Boolean(pkg.workspaces?.length);
 }
 
-// ──────────────────────────────────────────────
-//  Main detection function
-// ──────────────────────────────────────────────
+function cacheContext(root: string, context: ProjectContext): ProjectContext {
+	contextCache.set(root, context);
+	return context;
+}
 
-/**
- * Detect project context from the workspace root.
- * Reads files lazily; caches result forever.
- *
- * @param workspaceRoot - Path to the project root (usually process.cwd())
- */
-export async function detectProjectContext(
-	workspaceRoot: string,
-): Promise<ProjectContext | null> {
-	if (detectionAttempted) return cachedContext;
-	detectionAttempted = true;
+export async function detectProjectContext(workspaceRoot: string): Promise<ProjectContext | null> {
+	const root = resolve(workspaceRoot);
+	lastWorkspaceRoot = root;
+	if (contextCache.has(root)) return contextCache.get(root) ?? null;
 
-	// JavaScript / TypeScript
-	const pkgJson = await readJSON<PackageJson>(join(workspaceRoot, "package.json"));
+	const pkgJson = await readJSON<PackageJson>(join(root, "package.json"));
 	if (pkgJson) {
-		const hasTs =
-			!!pkgJson.devDependencies?.typescript ||
-			!!pkgJson.dependencies?.typescript ||
-			(await fileExists(join(workspaceRoot, "tsconfig.json")));
-		const framework = detectFrameworkFromDeps(pkgJson.dependencies) ??
-			detectFrameworkFromDeps(pkgJson.devDependencies);
-		const pm = detectPackageManager(pkgJson);
-		const isMono = isMonorepo(pkgJson);
-
-		cachedContext = {
+		const hasTs = Boolean(
+			pkgJson.devDependencies?.typescript ||
+			pkgJson.dependencies?.typescript ||
+			await fileExists(join(root, "tsconfig.json")),
+		);
+		return cacheContext(root, {
 			language: hasTs ? "TypeScript" : "JavaScript",
 			runtime: "node",
-			framework,
-			packageManager: pm,
-			type: isMono ? "monorepo" : "single",
-		};
-		return cachedContext;
+			framework: detectFrameworkFromDeps(pkgJson.dependencies) ?? detectFrameworkFromDeps(pkgJson.devDependencies),
+			packageManager: detectPackageManager(pkgJson),
+			type: isMonorepo(pkgJson) ? "monorepo" : "single",
+		});
 	}
 
-	// Go
-	if (await fileExists(join(workspaceRoot, "go.mod"))) {
-		cachedContext = {
-			language: "Go",
-			runtime: "go",
-			type: "single",
-		};
-		return cachedContext;
+	const markerChecks: Array<[string, ProjectContext]> = [
+		["go.mod", { language: "Go", runtime: "go", type: "single" }],
+		["pyproject.toml", { language: "Python", runtime: "python", type: "single" }],
+		["requirements.txt", { language: "Python", runtime: "python", type: "single" }],
+		["Cargo.toml", { language: "Rust", runtime: "rust", packageManager: "cargo", type: "single" }],
+		["pom.xml", { language: "Java", runtime: "jvm", type: "single" }],
+		["Gemfile", { language: "Ruby", runtime: "ruby", type: "single" }],
+		["composer.json", { language: "PHP", runtime: "php", type: "single" }],
+	];
+	for (const [marker, context] of markerChecks) {
+		if (await fileExists(join(root, marker))) return cacheContext(root, context);
 	}
 
-	// Python
-	if (await fileExists(join(workspaceRoot, "pyproject.toml"))) {
-		cachedContext = {
-			language: "Python",
-			runtime: "python",
-			type: "single",
-		};
-		return cachedContext;
-	}
-	if (await fileExists(join(workspaceRoot, "requirements.txt"))) {
-		cachedContext = {
-			language: "Python",
-			runtime: "python",
-			type: "single",
-		};
-		return cachedContext;
+	if (await fileExists(join(root, "build.gradle")) || await fileExists(join(root, "build.gradle.kts"))) {
+		return cacheContext(root, { language: "Java/Kotlin", runtime: "jvm", type: "single" });
 	}
 
-	// Rust
-	if (await fileExists(join(workspaceRoot, "Cargo.toml"))) {
-		cachedContext = {
-			language: "Rust",
-			runtime: "rust",
-			packageManager: "cargo",
-			type: "single",
-		};
-		return cachedContext;
-	}
-
-	// Java / Kotlin
-	if (await fileExists(join(workspaceRoot, "build.gradle")) ||
-		await fileExists(join(workspaceRoot, "build.gradle.kts"))) {
-		cachedContext = {
-			language: "Java/Kotlin",
-			runtime: "jvm",
-			type: "single",
-		};
-		return cachedContext;
-	}
-	if (await fileExists(join(workspaceRoot, "pom.xml"))) {
-		cachedContext = {
-			language: "Java",
-			runtime: "jvm",
-			type: "single",
-		};
-		return cachedContext;
-	}
-
-	// Ruby
-	if (await fileExists(join(workspaceRoot, "Gemfile"))) {
-		cachedContext = {
-			language: "Ruby",
-			runtime: "ruby",
-			type: "single",
-		};
-		return cachedContext;
-	}
-
-	// PHP
-	if (await fileExists(join(workspaceRoot, "composer.json"))) {
-		cachedContext = {
-			language: "PHP",
-			runtime: "php",
-			type: "single",
-		};
-		return cachedContext;
-	}
-
-	// .NET — scan directory for .csproj or .sln files
 	try {
-		const entries = await readdir(workspaceRoot);
-		const hasDotNet = entries.some(
-			(e) => e.endsWith(".csproj") || e.endsWith(".sln"),
-		);
-		if (hasDotNet) {
-			cachedContext = {
+		const entries = await readdir(root);
+		if (entries.some((entry) => entry.endsWith(".csproj") || entry.endsWith(".sln"))) {
+			return cacheContext(root, {
 				language: "C#",
 				runtime: "dotnet",
 				packageManager: "nuget",
 				type: "single",
-			};
-			return cachedContext;
+			});
 		}
 	} catch {
-		// readdir failed — skip .NET detection
+		// Directory access failure leaves context unknown.
 	}
 
-	cachedContext = {
-		language: "Unknown",
-		type: "single",
-	};
-	return cachedContext;
+	return cacheContext(root, { language: "Unknown", type: "single" });
 }
 
-/**
- * Return the cached context (null if not yet detected).
- */
-export function getCachedContext(): ProjectContext | null {
-	return cachedContext;
+export function getCachedContext(workspaceRoot?: string): ProjectContext | null {
+	const root = workspaceRoot ? resolve(workspaceRoot) : lastWorkspaceRoot;
+	return root ? contextCache.get(root) ?? null : null;
 }
 
-/**
- * Reset the cache (e.g., on session change).
- */
 export function resetContext(): void {
-	cachedContext = null;
-	detectionAttempted = false;
+	contextCache.clear();
+	lastWorkspaceRoot = undefined;
 }
