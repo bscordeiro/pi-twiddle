@@ -5,3 +5,4 @@ coverage/
 *.log
 .env
 *.Zone.Identifier
+copy-to-extensions.sh

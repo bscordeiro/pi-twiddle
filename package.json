@@ -13,7 +13,6 @@
     "config.ts",
     "footer.ts",
     "intent.ts",
-    "models.ts",
     "picker.ts",
     "optimizer.ts",
     "preserve.ts",
@@ -22,7 +21,7 @@
     "missing-model-warning.ts",
     "history.ts",
     "assets/icon.png",
-    "assets/prompt-report.png",
+    "assets/prompt-compare.png",
     "assets/settings.png",
     "README.md",
     "LICENSE"

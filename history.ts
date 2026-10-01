@@ -8,20 +8,69 @@ export interface AppliedTransformation {
 	applied: string;
 }
 
+export interface StoredComparison {
+	original: string;
+	applied: string;
+	model: string;
+	scope: string;
+	intent: string;
+	inputTokens: number | "?";
+	outputTokens: number | "?";
+	elapsed: string;
+	attempt: string;
+}
+
 export interface SessionEntrySource {
 	getBranch?: () => readonly unknown[];
 	getEntries?: () => readonly unknown[];
 }
 
+function loadSessionEntries(sessionManager: SessionEntrySource | undefined): readonly unknown[] {
+	try {
+		return sessionManager?.getBranch?.() ?? sessionManager?.getEntries?.() ?? [];
+	} catch {
+		return sessionManager?.getEntries?.() ?? [];
+	}
+}
+
+export function loadLatestComparison(
+	sessionManager: SessionEntrySource | undefined,
+): StoredComparison | null {
+	const entries = loadSessionEntries(sessionManager);
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== "twiddle-comparison") {
+			continue;
+		}
+		const data = entry.data;
+		if (!isRecord(data) || typeof data.original !== "string" || typeof data.applied !== "string") {
+			continue;
+		}
+		const attemptIndex = data.attemptIndex;
+		const totalModels = data.totalModels;
+		return {
+			original: data.original,
+			applied: data.applied,
+			model: typeof data.model === "string" ? data.model : "unknown model",
+			scope: typeof data.scope === "string" ? data.scope : "?",
+			intent: typeof data.intent === "string" ? data.intent : "none",
+			inputTokens: typeof data.inputTokens === "number" ? data.inputTokens : "?",
+			outputTokens: typeof data.outputTokens === "number" ? data.outputTokens : "?",
+			elapsed: typeof data.elapsed === "string" || typeof data.elapsed === "number"
+				? String(data.elapsed)
+				: "?",
+			attempt: typeof attemptIndex === "number" && typeof totalModels === "number"
+				? `${attemptIndex}/${totalModels}`
+				: "?",
+		};
+	}
+	return null;
+}
+
 export function loadAppliedTransformations(
 	sessionManager: SessionEntrySource | undefined,
 ): AppliedTransformation[] {
-	let entries: readonly unknown[] = [];
-	try {
-		entries = sessionManager?.getBranch?.() ?? sessionManager?.getEntries?.() ?? [];
-	} catch {
-		entries = sessionManager?.getEntries?.() ?? [];
-	}
+	const entries = loadSessionEntries(sessionManager);
 	return entries.flatMap((entry) => {
 		if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== "twiddle-comparison") {
 			return [];

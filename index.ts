@@ -10,30 +10,34 @@
  *
  * Commands:
  *   /twiddle        — open the control panel (all settings)
- *   /twiddle-model  — select optimization model
- *   /twiddle-threshold — show/set max expansion (0–500%)
+ *   /twiddle-compare — show the latest optimization comparison
+ *   /twiddle-auto-toggle — toggle auto-mode
  *   /twiddle-reset  — clear config
- *   /twiddle-auto-on     — enable auto-mode (footer: ≈ Twiddle)
- *   /twiddle-auto-off    — disable auto-mode (footer: ~ Twiddle)
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
-import { readConfig, getConfig, writeConfig, type TwiddleConfig } from "./config";
+import { getConfig, writeConfig, type TwiddleConfig } from "./config";
 import { formatFooterLabel, formatFooterShimmerFrame } from "./footer";
 import { optimizePrompt, buildSystemPrompt, detectScope, type Scope } from "./optimizer";
 import { detectIntent, type IntentCategory } from "./intent";
 import { detectProjectContext, getCachedContext } from "./project";
-import { filterModels } from "./models";
 import { searchableSelect } from "./picker";
 import { decideMissingModelSetup } from "./missing-model-warning";
 import {
 	applyKnownTransformations,
 	applyTextToUserMessage,
 	loadAppliedTransformations,
+	loadLatestComparison,
 	messageSignature,
 	type AppliedTransformation,
 } from "./history";
+
+const DEFAULT_AUTO_MIN_CHARS = 1;
+
+function isNumericPrompt(text: string): boolean {
+	return text.length > 0 && Number.isFinite(Number(text));
+}
 
 // ──────────────────────────────────────────────
 //  Types
@@ -213,25 +217,19 @@ export default function (pi: ExtensionAPI) {
 	// ── State ──────────────────────────────────
 	// Config is always read from disk to avoid stale state after module reloads.
 
-	// Optimization statistics (in-memory, per session)
-	const stats = {
-		totalOptimizations: 0,
-		appliedOptimizations: 0,
-		totalInputTokens: 0,
-		totalOutputTokens: 0,
-		totalElapsed: 0,
-		totalBudgetExceeded: 0,
-		fallbackUsed: 0,
-	};
-
-	// Last optimization details (for /twiddle-report preview)
-	let lastOptimization: {
-		text: string;
-		intent?: string;
-		scope: string;
-		inputTokens: number;
-		outputTokens: number;
-		elapsed: string;
+	// Last processed comparison, kept in memory for /twiddle-compare.
+	let lastComparison: {
+		original: string;
+		processed: string;
+		debug: {
+			model: string;
+			scope: string;
+			intent: string;
+			inputTokens: number | "?";
+			outputTokens: number | "?";
+			elapsed: string;
+			attempt: string;
+		};
 	} | null = null;
 
 	// ── Animation State ───────────────────────────
@@ -293,12 +291,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Comparison record: original vs applied text plus run metadata. Custom
-	// entries do NOT participate in LLM context, so the comparison stays
-	// visible in the session (collapsed) without polluting model context.
+	// entries do NOT participate in LLM context. Status stays visible only in
+	// debug mode; record remains persisted for audit and resume.
 	// The applied version is the single source of truth for what the agent
 	// received; the original is kept for audit and resume.
 	pi.registerEntryRenderer("twiddle-comparison", (entry, options, theme) => {
 		const data = (entry as any).data ?? {};
+		if (data.showStatus !== true) return new Text("", 0, 0);
 		const summary = theme.fg("muted",
 			`Twiddle: ${data.scope ?? "?"} ${data.inputTokens ?? "?"}→${data.outputTokens ?? "?"} tokens · ${data.model ?? "unknown model"} · ${data.elapsed ?? "?"}s`,
 		);
@@ -320,35 +319,53 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	// ── Commands ───────────────────────────────
-
-	// Shared model picker used by /twiddle-model, the /twiddle panel, and
-	// setup. Returns true when a model was selected and saved.
-	async function pickOptimizationModel(ctx: any, config: TwiddleConfig): Promise<boolean> {
-		const all = ctx.modelRegistry.getAvailable();
-
-		if (all.length === 0) {
-			ctx.ui.notify(
-				"No models available. Configure an API key first (/login).",
-				"warning",
-			);
-			return false;
-		}
-
-		const options = all.map((m: Model<Api>) => pickModelLabel(m));
-		const choice = await searchableSelect(ctx, "Select optimization model:", options);
-
-		if (choice === undefined) return false;
-		const idx = options.indexOf(choice);
-		const selected = all[idx];
-		config.model = { provider: selected.provider, id: selected.id };
-		await writeConfig(config);
-		updateFooterStatus(ctx, config);
-		ctx.ui.notify(`Twiddle model: ${pickModelLabel(selected)}`, "info");
-		return true;
+	function rememberComparison(data: {
+		original: string;
+		processed: string;
+		model: string;
+		intent?: IntentCategory;
+		scope: Scope;
+		inputTokens: number;
+		outputTokens: number;
+		elapsed: string;
+		attemptIndex: number;
+		totalModels: number;
+	}): void {
+		lastComparison = {
+			original: data.original,
+			processed: data.processed,
+			debug: {
+				model: data.model,
+				scope: data.scope,
+				intent: data.intent ?? "none",
+				inputTokens: data.inputTokens,
+				outputTokens: data.outputTokens,
+				elapsed: data.elapsed,
+				attempt: `${data.attemptIndex}/${data.totalModels}`,
+			},
+		};
 	}
 
-	// ── Control Panel ──────────────────────────────────
+	function getLatestComparison(ctx: any): typeof lastComparison {
+		if (lastComparison) return lastComparison;
+		const stored = loadLatestComparison((ctx as any).sessionManager);
+		if (!stored) return null;
+		return {
+			original: stored.original,
+			processed: stored.applied,
+			debug: {
+				model: stored.model,
+				scope: stored.scope,
+				intent: stored.intent,
+				inputTokens: stored.inputTokens,
+				outputTokens: stored.outputTokens,
+				elapsed: stored.elapsed,
+				attempt: stored.attempt,
+			},
+		};
+	}
+
+	// ── Commands ──────────────────────────────────
 	// Single entry point for all Twiddle settings. Re-reads config every
 	// iteration so the menu never shows stale values.
 	async function runControlPanel(ctx: any): Promise<void> {
@@ -363,7 +380,7 @@ export default function (pi: ExtensionAPI) {
 
 			const minCharsLabel = typeof config.minChars === "number"
 				? `${config.minChars} chars`
-				: "0 chars (default)";
+				: `${DEFAULT_AUTO_MIN_CHARS} chars (default)`;
 			const options = [
 				`Model: ${config.model ? `${config.model.provider}/${config.model.id}` : "not set"}`,
 				`Expansion limit: ${config.threshold ?? 40}%`,
@@ -421,7 +438,7 @@ export default function (pi: ExtensionAPI) {
 					break;
 				}
 				case 3: { // Auto-mode minimum
-					const raw = await ctx.ui.input("Minimum prompt length for auto-mode in chars (empty = default 0):") ?? "";
+					const raw = await ctx.ui.input(`Minimum prompt length for auto-mode in chars (empty = default ${DEFAULT_AUTO_MIN_CHARS}):`) ?? "";
 					if (raw.trim() === "") {
 						config.minChars = undefined;
 						await writeConfig(config);
@@ -509,108 +526,39 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("twiddle-model", {
-		description: "Twiddle: select optimization model (optional filter text)",
-		handler: async (args, ctx) => {
-			const config = await getConfig();
-			const all = ctx.modelRegistry.getAvailable();
-
-			if (all.length === 0) {
-				ctx.ui.notify(
-					"No models available. Configure an API key first (/login).",
-					"warning",
-				);
+	pi.registerCommand("twiddle-compare", {
+		description: "Twiddle: show the latest optimization comparison",
+		handler: async (_args, ctx) => {
+			const comparison = getLatestComparison(ctx);
+			if (!comparison) {
+				ctx.ui.notify("No processed text yet.", "info");
 				return;
 			}
 
-			// Optional typed filter: /twiddle-model <text> narrows the catalog
-			// by provider, id, or name before showing the selector.
-			const query = (args ?? "").trim();
-			if (query) {
-				const candidates = filterModels(all, query);
-				if (candidates.length === 0) {
-					ctx.ui.notify(`No models match "${args}".`, "info");
-					return;
-				}
-				if (candidates.length === 1) {
-					const selected = candidates[0];
-					config.model = { provider: selected.provider, id: selected.id };
-					await writeConfig(config);
-					updateFooterStatus(ctx, config);
-					ctx.ui.notify(`Twiddle model: ${pickModelLabel(selected)}`, "info");
-					return;
-				}
-				// Multiple matches: fall through to the full picker below.
-				// (Filtering the picker list itself stays a future refinement.)
-			}
-
-			await pickOptimizationModel(ctx, config);
-		},
-	});
-
-	pi.registerCommand("twiddle-threshold", {
-		description: "Twiddle: show or set max expansion of optimized text (0–500%)",
-		handler: async (args, ctx) => {
-			const config = await getConfig();
-
-			if (!args) {
-				ctx.ui.notify(
-					`Current expansion limit: ${config.threshold ?? 40}%. Optimized text longer than input + limit is discarded and the original is sent. Use /twiddle-threshold <N> to change (ex: /twiddle-threshold 40).`,
-					"info",
-				);
-				return;
-			}
-
-			const val = Number.parseInt(args, 10);
-			if (Number.isNaN(val) || val < 0 || val > 500) {
-				ctx.ui.notify("Expansion limit must be between 0 and 500.", "error");
-				return;
-			}
-			config.threshold = val;
-			await writeConfig(config);
+			const { debug } = comparison;
 			ctx.ui.notify(
-				`Twiddle expansion limit set to ${val}% (optimized text may be ${val}% longer than input at most).`,
+				`Debug: model=${debug.model} · scope=${debug.scope} · intent=${debug.intent} · ` +
+				`tokens=${debug.inputTokens}→${debug.outputTokens} · elapsed=${debug.elapsed}s · attempt=${debug.attempt}`,
 				"info",
 			);
+			ctx.ui.notify(`Original: ${comparison.original}`, "info");
+			ctx.ui.notify(`Processed: ${comparison.processed}`, "info");
 		},
 	});
 
-	pi.registerCommand("twiddle-min-chars", {
-		description: "Twiddle: show or set minimum prompt length for auto-mode (chars)",
-		handler: async (args, ctx) => {
+	pi.registerCommand("twiddle-auto-toggle", {
+		description: "Twiddle: toggle auto-mode",
+		handler: async (_args, ctx) => {
 			const config = await getConfig();
-			const current = typeof config.minChars === "number"
-				? `${config.minChars} chars`
-				: "0 chars (default — every prompt eligible)";
-
-			if (!args) {
-				ctx.ui.notify(
-					`Current auto-mode minimum: ${current}. Shorter auto-mode prompts are sent unchanged; ~ always optimizes. Use /twiddle-min-chars <N> to set, or /twiddle-min-chars off to restore the default.`,
-					"info",
-				);
-				return;
-			}
-
-			if (args.toLowerCase().trim() === "off") {
-				config.minChars = undefined;
-				await writeConfig(config);
-				ctx.ui.notify("Auto-mode minimum restored to the default (0 — every prompt eligible).", "info");
-				return;
-			}
-
-			const val = Number.parseInt(args, 10);
-			if (Number.isNaN(val) || val < 0) {
-				ctx.ui.notify("Minimum must be 0 or more characters, or off.", "error");
-				return;
-			}
-			config.minChars = val;
+			config.auto = !config.auto;
 			await writeConfig(config);
+			updateFooterStatus(ctx, config);
 			ctx.ui.notify(
-				val === 0
-					? "Auto-mode minimum disabled: length alone no longer skips optimization."
-					: `Auto-mode minimum set to ${val} chars. Shorter auto-mode prompts are sent unchanged; ~ always optimizes.`,
+				config.auto
+					? "auto-mode ON — eligible prompts are optimized."
+					: "auto-mode OFF — use ~ prefix to optimize.",
 				"info",
-				);
+			);
 		},
 	});
 
@@ -621,194 +569,6 @@ export default function (pi: ExtensionAPI) {
 			const config = await getConfig();
 			updateFooterStatus(ctx, config);
 			ctx.ui.notify("Twiddle config reset to defaults (model and fallbacks cleared).", "info");
-		},
-	});
-
-	pi.registerCommand("twiddle-auto-on", {
-		description: "Twiddle: enable auto-mode (footer: ≈ Twiddle)",
-		handler: async (_args, ctx) => {
-			const config = await getConfig();
-			config.auto = true;
-			await writeConfig(config);
-			updateFooterStatus(ctx, config);
-			ctx.ui.notify("auto-mode ON — eligible prompts are optimized.", "info");
-		},
-	});
-
-	pi.registerCommand("twiddle-auto-off", {
-		description: "Twiddle: disable auto-mode (footer: ~ Twiddle)",
-		handler: async (_args, ctx) => {
-			const config = await getConfig();
-			config.auto = false;
-			await writeConfig(config);
-			updateFooterStatus(ctx, config);
-			ctx.ui.notify("auto-mode OFF — use ~ prefix to optimize.", "info");
-		},
-	});
-
-	pi.registerCommand("twiddle-report", {
-		description: "Twiddle: show optimization statistics for this session",
-		handler: async (_args, ctx) => {
-			if (stats.totalOptimizations === 0) {
-				ctx.ui.notify("No optimizations yet this session.", "info");
-				return;
-			}
-			const avgRatio =
-				stats.totalInputTokens > 0
-					? ((stats.totalOutputTokens / stats.totalInputTokens) * 100).toFixed(0)
-					: "0";
-			const fallbackNote =
-				stats.fallbackUsed > 0
-					? ` · ${stats.fallbackUsed} via fallback`
-					: "";
-			const summary = `Twiddle Report: ${stats.totalOptimizations} attempts · ` +
-				`${stats.appliedOptimizations} applied · ` +
-				`${stats.totalBudgetExceeded} rejected over expansion limit · ` +
-				`~${stats.totalInputTokens}→~${stats.totalOutputTokens} est. tokens ` +
-				`(avg ${avgRatio}%) · ` +
-				`${stats.totalElapsed.toFixed(0)}s total` +
-				fallbackNote;
-			ctx.ui.notify(summary, "info");
-
-			// Show last optimization preview
-			if (lastOptimization) {
-				const lo = lastOptimization;
-				const intentLabel = lo.intent ? ` | 🎯 ${lo.intent}` : "";
-				const header = `Last applied: 📐 ${lo.scope}${intentLabel} | 🧾 ~${lo.inputTokens}→~${lo.outputTokens} est. tokens ⏳ ${lo.elapsed}s | full comparison stored in the session entry`;
-				ctx.ui.notify(header, "info");
-				ctx.ui.notify(lo.text, "info");
-			}
-		},
-	});
-
-	pi.registerCommand("twiddle-verbose", {
-		description: "Twiddle: set verbosity level (quiet, debug)",
-		handler: async (args, ctx) => {
-			const config = await getConfig();
-			const current = config.verbose ?? "quiet";
-
-			if (!args) {
-				ctx.ui.notify(`Current verbosity: ${current}. Use /twiddle-verbose <quiet|debug>.`, "info");
-				return;
-			}
-
-			const level = args.toLowerCase().trim();
-			if (level !== "quiet" && level !== "debug") {
-				ctx.ui.notify("Use: quiet or debug.", "error");
-				return;
-			}
-
-			config.verbose = level as "quiet" | "debug";
-			await writeConfig(config);
-			ctx.ui.notify(`Twiddle verbosity: ${level}.`, "info");
-		},
-	});
-
-	pi.registerCommand("twiddle-timeout", {
-		description: "Twiddle: set optimization timeout in seconds (default: 15)",
-		handler: async (args, ctx) => {
-			const config = await getConfig();
-
-			if (!args) {
-				ctx.ui.notify(
-					`Current timeout: ${config.timeout ?? 15}s. Use /twiddle-timeout <N> (5-60).`,
-					"info",
-				);
-				return;
-			}
-
-			const val = Number.parseInt(args, 10);
-			if (Number.isNaN(val) || val < 5 || val > 60) {
-				ctx.ui.notify("Timeout must be between 5 and 60 seconds.", "error");
-				return;
-			}
-			config.timeout = val;
-			await writeConfig(config);
-			ctx.ui.notify(`Twiddle timeout set to ${val}s.`, "info");
-		},
-	});
-
-	pi.registerCommand("twiddle-fallback", {
-		description: "Twiddle: manage fallback models (add, remove, list, clear)",
-		handler: async (args, ctx) => {
-			const config = await getConfig();
-			const fallbacks = config.fallbackModels ?? [];
-
-			if (!args) {
-				if (fallbacks.length === 0) {
-					ctx.ui.notify("No fallback models configured. Use /twiddle-fallback add <provider/id>.", "info");
-				} else {
-					const list = fallbacks.map((m, i) => `${i + 1}. ${m.provider}/${m.id}`).join(" · ");
-					ctx.ui.notify(`Fallbacks (${fallbacks.length}): ${list}`, "info");
-				}
-				return;
-			}
-
-			const parts = args.split(/\s+/);
-			const action = parts[0].toLowerCase();
-
-			if (action === "list") {
-				if (fallbacks.length === 0) {
-					ctx.ui.notify("No fallback models configured. Use /twiddle-fallback add to pick one.", "info");
-				} else {
-					const list = fallbacks.map((m, i) => `${i + 1}. ${m.provider}/${m.id}`).join(" · ");
-					ctx.ui.notify(`Fallbacks (${fallbacks.length}): ${list}`, "info");
-				}
-				return;
-			}
-
-			if (action === "clear") {
-				config.fallbackModels = [];
-				await writeConfig(config);
-				ctx.ui.notify("All fallback models cleared.", "info");
-				return;
-			}
-
-			if (action === "add") {
-				// Show model selector instead of free-text input
-				const all = ctx.modelRegistry.getAvailable();
-				if (all.length === 0) {
-					ctx.ui.notify("No models available. Configure an API key first.", "warning");
-					return;
-				}
-				const existingRefs = new Set(fallbacks.map((m) => `${m.provider}/${m.id}`));
-				if (config.model) existingRefs.add(`${config.model.provider}/${config.model.id}`);
-				const available = all.filter(
-					(m) => !existingRefs.has(`${m.provider}/${m.id}`),
-				);
-				if (available.length === 0) {
-					ctx.ui.notify("All available models are already configured (primary or fallback).", "info");
-					return;
-				}
-				const options = available.map((m) => `${m.provider}/${m.id}  (${m.name})`);
-				options.push("Cancel");
-				const pick = await searchableSelect(ctx, "Select fallback model:", options);
-				if (pick !== undefined && pick !== "Cancel") {
-					const idx = options.indexOf(pick);
-					const selected = available[idx];
-					fallbacks.push({ provider: selected.provider, id: selected.id });
-					config.fallbackModels = fallbacks;
-					await writeConfig(config);
-					ctx.ui.notify(`Fallback added: ${selected.provider}/${selected.id}.`, "info");
-				}
-				return;
-			}
-
-			if (action === "remove" && parts[1]) {
-				const ref = parts[1];
-				const idx = fallbacks.findIndex((m) => `${m.provider}/${m.id}` === ref);
-				if (idx === -1) {
-					ctx.ui.notify(`Fallback not found: ${ref}.`, "error");
-					return;
-				}
-				fallbacks.splice(idx, 1);
-				config.fallbackModels = fallbacks;
-				await writeConfig(config);
-				ctx.ui.notify(`Fallback removed: ${ref}.`, "info");
-				return;
-			}
-
-			ctx.ui.notify("Use: /twiddle-fallback [add|remove|list|clear].", "error");
 		},
 	});
 
@@ -850,8 +610,6 @@ export default function (pi: ExtensionAPI) {
 			scope,
 		});
 
-		// Count request before provider execution so exhausted chains remain visible.
-		stats.totalOptimizations++;
 		startTwiddleAnim(ctx, config);
 		const fr = await optimizeWithFallback(
 			req.effectiveText,
@@ -866,26 +624,6 @@ export default function (pi: ExtensionAPI) {
 		stopTwiddleAnim(ctx, config);
 
 		const elapsed = ((Date.now() - req.startTime) / 1000).toFixed(1);
-
-		stats.totalInputTokens += fr.result.inputTokens;
-		stats.totalOutputTokens += fr.result.outputTokens;
-		stats.totalElapsed += parseFloat(elapsed);
-		if (fr.isFallback) {
-			stats.fallbackUsed++;
-		}
-		if (fr.result.exceedsBudget) {
-			stats.totalBudgetExceeded++;
-		} else {
-			stats.appliedOptimizations++;
-			lastOptimization = {
-				text: fr.result.optimizedText,
-				intent,
-				scope,
-				inputTokens: fr.result.inputTokens,
-				outputTokens: fr.result.outputTokens,
-				elapsed,
-			};
-		}
 
 		return { fr, elapsed, intent, scope };
 	}
@@ -930,7 +668,7 @@ export default function (pi: ExtensionAPI) {
 		if (choice === undefined || choice === "Cancel") {
 			missingModelSetupSilencedForSession = true;
 			twiddleNotify(ctx, config, "debug",
-				"Twiddle: no model selected. Prompts will be sent unchanged this session. Use /twiddle-model to enable optimization.",
+				"Twiddle: no model selected. Prompts will be sent unchanged this session. Use /twiddle to enable optimization.",
 				"warning",
 			);
 			return false;
@@ -980,7 +718,7 @@ export default function (pi: ExtensionAPI) {
 		const startTime = Date.now();
 
 		try {
-			const { fr, elapsed } = await runOptimizationCore({
+			const { fr, elapsed, intent, scope } = await runOptimizationCore({
 				effectiveText,
 				forcedIntent: parsed.intent,
 				model: config.model,
@@ -1012,21 +750,38 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(fr.result.optimizedText, "info");
 			}
 
+			const totalModels = 1 + (config.fallbackModels?.length ?? 0);
+			const processed = `${commandPrefix} ${fr.result.optimizedText}`;
+			rememberComparison({
+				original: text,
+				processed,
+				model: `${fr.usedModel.provider}/${fr.usedModel.id}`,
+				intent,
+				scope,
+				inputTokens: fr.result.inputTokens,
+				outputTokens: fr.result.outputTokens,
+				elapsed,
+				attemptIndex: fr.attemptIndex,
+				totalModels,
+			});
 			recordComparison({
 				original: text,
-				applied: `${commandPrefix} ${fr.result.optimizedText}`,
+				applied: processed,
 				model: `${fr.usedModel.provider}/${fr.usedModel.id}`,
 				inputTokens: fr.result.inputTokens,
 				outputTokens: fr.result.outputTokens,
 				elapsed,
 				scope: detectScope(effectiveText),
 				exceedsBudget: fr.result.exceedsBudget,
+				intent: intent ?? null,
+				attemptIndex: fr.attemptIndex,
+				totalModels,
+				showStatus: verbose === "debug",
 			});
 			return { action: "transform", text: `${commandPrefix} ${fr.result.optimizedText}` };
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-			stats.totalElapsed += parseFloat(elapsed);
 			stopTwiddleAnim(ctx, config);
 			twiddleNotify(ctx, config, "quiet", `Twiddle: error — sending original. ${message}`, "warning");
 			return;
@@ -1077,10 +832,10 @@ export default function (pi: ExtensionAPI) {
 		const rawPrompt = hasPrefix ? trimmed.slice(1).trim() : trimmed;
 		if (!rawPrompt) return;
 
-		// Auto-mode length filter (plain prompts only; `~` always bypasses it).
-		// Default minimum is 0: every auto-mode prompt is eligible.
+		// Auto-mode filters (plain prompts only; `~` always bypasses them).
 		if (config.auto && !hasPrefix) {
-			const minChars = config.minChars ?? 0;
+			if (isNumericPrompt(rawPrompt)) return;
+			const minChars = config.minChars ?? DEFAULT_AUTO_MIN_CHARS;
 			if (minChars > 0 && rawPrompt.length < minChars) return;
 		}
 
@@ -1182,6 +937,19 @@ export default function (pi: ExtensionAPI) {
 				if (signature !== null) {
 					appliedTransformations.push({ original: signature, applied: fr.result.optimizedText });
 				}
+				const totalModels = 1 + (fallbackModels?.length ?? 0);
+				rememberComparison({
+					original: signature ?? effectiveText,
+					processed: fr.result.optimizedText,
+					model: `${fr.usedModel.provider}/${fr.usedModel.id}`,
+					intent,
+					scope,
+					inputTokens: fr.result.inputTokens,
+					outputTokens: fr.result.outputTokens,
+					elapsed,
+					attemptIndex: fr.attemptIndex,
+					totalModels,
+				});
 				recordComparison({
 					original: signature ?? effectiveText,
 					applied: fr.result.optimizedText,
@@ -1192,6 +960,9 @@ export default function (pi: ExtensionAPI) {
 					intent: intent ?? null,
 					scope,
 					exceedsBudget: false,
+					attemptIndex: fr.attemptIndex,
+					totalModels,
+					showStatus: verbose === "debug",
 				});
 			}
 
@@ -1210,7 +981,6 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-			stats.totalElapsed += parseFloat(elapsed);
 			stopTwiddleAnim(ctx, config);
 			ctx.ui.notify(`⚠️ Twiddle: ${buildModelChain(modelRef, fallbackModels)} | all failed in ${elapsed}s | ${message}`, "warning");
 			return { messages };

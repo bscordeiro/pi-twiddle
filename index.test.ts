@@ -25,6 +25,7 @@ import extensionFactory from "./index.ts";
 function setup(execStdout = "Improve login handling.", models: Array<{ provider: string; id: string; name: string }> = []) {
 	const handlers: Record<string, (...args: never[]) => unknown> = {};
 	const commands: Record<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }> = {};
+	const commandNames: string[] = [];
 	const entryRenderers: Record<string, (entry: unknown, options: unknown, theme: unknown) => unknown> = {};
 	const pi = {
 		on: (name: string, fn: (...args: never[]) => unknown) => {
@@ -32,6 +33,7 @@ function setup(execStdout = "Improve login handling.", models: Array<{ provider:
 		},
 		registerCommand: (name: string, cmd: { handler: (args: string, ctx: unknown) => Promise<unknown> }) => {
 			commands[name] = cmd;
+			commandNames.push(name);
 		},
 		registerMessageRenderer: () => {},
 		registerEntryRenderer: (name: string, renderer: (entry: unknown, options: unknown, theme: unknown) => unknown) => {
@@ -54,7 +56,7 @@ function setup(execStdout = "Improve login handling.", models: Array<{ provider:
 		sessionManager: { getEntries: () => [] },
 		signal: undefined,
 	};
-	return { handlers, pi, ctx, commands, entryRenderers };
+	return { handlers, pi, ctx, commands, commandNames, entryRenderers };
 }
 
 beforeEach(() => {
@@ -119,7 +121,7 @@ describe("plain-prompt event flow", () => {
 		expect(pi.exec).toHaveBeenCalledTimes(1);
 	});
 
-	it("quiet mode shows only concise comparison entry", async () => {
+	it("suppresses comparison status line in quiet mode", async () => {
 		const { handlers, pi, ctx, entryRenderers } = setup();
 		const before = handlers["before_agent_start"] as (
 			event: unknown,
@@ -134,26 +136,21 @@ describe("plain-prompt event flow", () => {
 			{ messages: [{ role: "user", content: "~melhore o tratamento do login" }] },
 			ctx,
 		);
-		expect(pi.appendEntry).toHaveBeenCalledTimes(1);
 		const [customType, data] = (pi.appendEntry as ReturnType<typeof vi.fn>).mock.calls[0];
 		expect(customType).toBe("twiddle-comparison");
-		expect(data).toMatchObject({
-			original: "~melhore o tratamento do login",
-			applied: "Improve login handling.",
-		});
-		expect(pi.sendMessage).not.toHaveBeenCalled();
-		expect(ctx.ui.notify).not.toHaveBeenCalled();
 		const rendered = entryRenderers["twiddle-comparison"](
-			{ data: { scope: "trivial", inputTokens: 20, outputTokens: 21, model: "opencode/ling-3.0-flash-fin-free", elapsed: "14.0" } },
+			{ data },
 			{},
 			{ fg: (_color: string, content: string) => content },
 		) as { content: string };
-		expect(rendered.content).toBe("Twiddle: trivial 20→21 tokens · opencode/ling-3.0-flash-fin-free · 14.0s");
+		expect(rendered.content).toBe("");
+		expect(pi.sendMessage).not.toHaveBeenCalled();
+		expect(ctx.ui.notify).not.toHaveBeenCalled();
 	});
 
-	it("shows processed text after metadata in debug mode", async () => {
+	it("shows comparison status line in debug mode", async () => {
 		Object.assign(memConfig, { verbose: "debug" });
-		const { handlers, ctx } = setup();
+		const { handlers, pi, ctx, entryRenderers } = setup();
 		await (handlers["before_agent_start"] as any)({ prompt: "~melhore o tratamento do login" }, ctx);
 		await (handlers["context"] as any)(
 			{ messages: [{ role: "user", content: "~melhore o tratamento do login" }] },
@@ -163,6 +160,13 @@ describe("plain-prompt event flow", () => {
 			expect.stringMatching(/^Twiddle~/),
 			"Improve login handling.",
 		]);
+		const [, data] = (pi.appendEntry as ReturnType<typeof vi.fn>).mock.calls[0];
+		const rendered = entryRenderers["twiddle-comparison"](
+			{ data },
+			{},
+			{ fg: (_color: string, content: string) => content },
+		) as { content: string };
+		expect(rendered.content).toMatch(/^Twiddle: trivial 8→6 tokens · mock\/mock · \d+\.\ds$/);
 	});
 
 	it("shows processed command text in debug mode", async () => {
@@ -235,16 +239,16 @@ describe("plain-prompt event flow", () => {
 			event: unknown,
 			ctx: unknown,
 		) => Promise<{ messages: Array<{ role: string; content: unknown }> } | undefined>;
-		// Exactly 10 chars without prefix: passes the filter.
-		await before({ prompt: "1234567890" }, ctx);
+		// Exactly 10 non-numeric chars without prefix: passes the filter.
+		await before({ prompt: "abcdefghij" }, ctx);
 		const atBoundary = await onContext(
-			{ messages: [{ role: "user", content: "1234567890" }] },
+			{ messages: [{ role: "user", content: "abcdefghij" }] },
 			ctx,
 		);
 		expect(atBoundary?.messages[0].content).toBe("Improve login handling.");
 	});
 
-	it("processes short auto-mode prompts by default (minimum 0)", async () => {
+	it("skips numeric-only auto-mode prompts regardless of length", async () => {
 		Object.assign(memConfig, { auto: true });
 		expect(memConfig.minChars).toBeUndefined();
 		const { handlers, pi, ctx } = setup();
@@ -256,8 +260,25 @@ describe("plain-prompt event flow", () => {
 			event: unknown,
 			ctx: unknown,
 		) => Promise<{ messages: Array<{ role: string; content: unknown }> } | undefined>;
-		await before({ prompt: "oi" }, ctx);
-		const result = await onContext({ messages: [{ role: "user", content: "oi" }] }, ctx);
+		await before({ prompt: "10" }, ctx);
+		const result = await onContext({ messages: [{ role: "user", content: "10" }] }, ctx);
+		expect(result).toBeUndefined();
+		expect(pi.exec).not.toHaveBeenCalled();
+	});
+
+	it("processes one-character non-numeric auto-mode prompts with default minimum 1", async () => {
+		Object.assign(memConfig, { auto: true });
+		const { handlers, pi, ctx } = setup();
+		const before = handlers["before_agent_start"] as (
+			event: unknown,
+			ctx: unknown,
+		) => Promise<unknown>;
+		const onContext = handlers["context"] as (
+			event: unknown,
+			ctx: unknown,
+		) => Promise<{ messages: Array<{ role: string; content: unknown }> } | undefined>;
+		await before({ prompt: "x" }, ctx);
+		const result = await onContext({ messages: [{ role: "user", content: "x" }] }, ctx);
 		expect(result?.messages[0].content).toBe("Improve login handling.");
 		expect(pi.exec).toHaveBeenCalledTimes(1);
 	});
@@ -289,52 +310,77 @@ describe("plain-prompt event flow", () => {
 		expect(result).toEqual({ action: "transform", text: "/tdd melhore o login" });
 	});
 
-	it("selects the single filtered model without opening the selector", async () => {
-		const models = [
-			{ provider: "openai", id: "gpt-4o", name: "GPT-4o" },
-			{ provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
-		];
-		const { commands, ctx, pi } = setup("Improve login handling.", models);
-		(ctx.ui as unknown as { select: unknown }).select = () => {
-			throw new Error("selector must not open for a single match");
-		};
-		await commands["twiddle-model"].handler("sonnet", ctx);
-		expect(memConfig).toMatchObject({ model: { provider: "anthropic", id: "claude-sonnet-4-5" } });
-		expect(pi.appendEntry).not.toHaveBeenCalled();
+	it("registers only the supported command set with compare below twiddle", () => {
+		const { commandNames } = setup();
+		expect(commandNames).toEqual([
+			"twiddle",
+			"twiddle-compare",
+			"twiddle-auto-toggle",
+			"twiddle-reset",
+		]);
 	});
 
-	it("reports no match instead of opening the selector", async () => {
-		const models = [{ provider: "openai", id: "gpt-4o", name: "GPT-4o" }];
-		const { commands, ctx } = setup("Improve login handling.", models);
-		await commands["twiddle-model"].handler("zzz-no-such-model", ctx);
-		expect(memConfig.model).toEqual({ provider: "mock", id: "mock" });
-		expect((ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatch(/No models match/);
-	});
-
-	it("lists fallback models for the documented list subcommand", async () => {
-		Object.assign(memConfig, {
-			fallbackModels: [{ provider: "openai", id: "gpt-4o-mini" }],
-		});
+	it("toggles auto-mode with the unified command", async () => {
 		const { commands, ctx } = setup();
-		await commands["twiddle-fallback"].handler("list", ctx);
-		expect((ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatch(/Fallbacks \(1\): 1\. openai\/gpt-4o-mini/);
+		await commands["twiddle-auto-toggle"].handler("", ctx);
+		expect(memConfig.auto).toBe(true);
+		await commands["twiddle-auto-toggle"].handler("", ctx);
+		expect(memConfig.auto).toBe(false);
 	});
 
-	it("rejects removed normal verbosity level", async () => {
-		const { commands, ctx } = setup();
-		await commands["twiddle-verbose"].handler("normal", ctx);
-		expect(memConfig.verbose).toBe("quiet");
-		expect((ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe("Use: quiet or debug.");
+	it("shows debug data, original text, and processed text in compare", async () => {
+		const { handlers, commands, ctx } = setup();
+		await (handlers["before_agent_start"] as any)({ prompt: "~melhore o tratamento do login" }, ctx);
+		await (handlers["context"] as any)(
+			{ messages: [{ role: "user", content: "~melhore o tratamento do login" }] },
+			ctx,
+		);
+		await commands["twiddle-compare"].handler("", ctx);
+		expect((ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[0])).toEqual([
+			expect.stringMatching(/^Debug: model=mock\/mock · scope=trivial · intent=none · tokens=8→6 · elapsed=\d+\.\ds · attempt=1\/1$/),
+			"Original: ~melhore o tratamento do login",
+			"Processed: Improve login handling.",
+		]);
 	});
 
-	it("sets and clears the auto-mode minimum via command", async () => {
-		const { commands, ctx } = setup();
-		await commands["twiddle-min-chars"].handler("80", ctx);
-		expect(memConfig.minChars).toBe(80);
-		await commands["twiddle-min-chars"].handler("off", ctx);
-		expect(memConfig.minChars).toBeUndefined();
-		await commands["twiddle-min-chars"].handler("nope", ctx);
-		expect((ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1]).toBe("error");
+	it("compare reports most recently processed text", async () => {
+		const { handlers, commands, ctx } = setup();
+		await (handlers["before_agent_start"] as any)({ prompt: "~first request" }, ctx);
+		await (handlers["context"] as any)(
+			{ messages: [{ role: "user", content: "~first request" }] },
+			ctx,
+		);
+		await (handlers["before_agent_start"] as any)({ prompt: "~second request" }, ctx);
+		await (handlers["context"] as any)(
+			{ messages: [{ role: "user", content: "~second request" }] },
+			ctx,
+		);
+		(ctx.sessionManager as any).getBranch = () => [{
+			type: "custom",
+			customType: "twiddle-comparison",
+			data: {
+				original: "~stale persisted request",
+				applied: "Stale persisted result",
+				model: "mock/mock",
+				scope: "trivial",
+				inputTokens: 1,
+				outputTokens: 1,
+				elapsed: "0.1",
+			},
+		}];
+		await commands["twiddle-compare"].handler("", ctx);
+		const notifications = (ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[0]);
+		expect(notifications[1]).toBe("Original: ~second request");
+		expect(notifications[2]).toBe("Processed: Improve login handling.");
+	});
+
+	it("compare preserves command prefix in original and processed text", async () => {
+		const { handlers, commands, ctx } = setup();
+		await (handlers["input"] as any)({ text: "/tdd ~melhore o login", source: "interactive" }, ctx);
+		await commands["twiddle-compare"].handler("", ctx);
+		const notifications = (ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[0]);
+		expect(notifications[1]).toBe("Original: /tdd ~melhore o login");
+		expect(notifications[2]).toBe("Processed: /tdd Improve login handling.");
 	});
 
 	it("cancels without fallback attempts when the turn is aborted", async () => {
@@ -463,12 +509,49 @@ describe("plain-prompt event flow", () => {
 		expect(result).toEqual({ action: "transform", text: "/skill:test keep this text" });
 	});
 
-	it("counts failed optimization requests in the report", async () => {
-		const { handlers, commands, pi, ctx } = setup();
-		pi.exec.mockRejectedValueOnce(new Error("provider failure"));
-		await (handlers["before_agent_start"] as any)({ prompt: "~fail this request" }, ctx);
-		await (handlers["context"] as any)({ messages: [{ role: "user", content: "~fail this request" }] }, ctx);
-		await commands["twiddle-report"].handler("", ctx);
-		expect((ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[0]).join("\n")).toMatch(/1 attempts/);
+	it("compare reports no processed text before the first optimization", async () => {
+		const { commands, ctx } = setup();
+		await commands["twiddle-compare"].handler("", ctx);
+		expect((ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[0])).toEqual([
+			"No processed text yet.",
+		]);
+	});
+
+	it("compare loads the latest persisted comparison after reload", async () => {
+		const { commands, ctx } = setup();
+		(ctx.sessionManager as any).getBranch = () => [
+			{
+				type: "custom",
+				customType: "twiddle-comparison",
+				data: {
+					original: "~older request",
+					applied: "Older processed request",
+					model: "mock/mock",
+					scope: "trivial",
+					inputTokens: 4,
+					outputTokens: 3,
+					elapsed: "0.1",
+				},
+			},
+			{
+				type: "custom",
+				customType: "twiddle-comparison",
+				data: {
+					original: "~latest request",
+					applied: "Latest processed request",
+					model: "mock/mock",
+					scope: "low",
+					inputTokens: 6,
+					outputTokens: 5,
+					elapsed: "0.2",
+				},
+			},
+		];
+		await commands["twiddle-compare"].handler("", ctx);
+		expect((ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[0])).toEqual([
+			"Debug: model=mock/mock · scope=low · intent=none · tokens=6→5 · elapsed=0.2s · attempt=?",
+			"Original: ~latest request",
+			"Processed: Latest processed request",
+		]);
 	});
 });

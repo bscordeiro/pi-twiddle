@@ -13,7 +13,6 @@ cp \
   "$SRC/config.ts" \
   "$SRC/footer.ts" \
   "$SRC/intent.ts" \
-  "$SRC/models.ts" \
   "$SRC/picker.ts" \
   "$SRC/optimizer.ts" \
   "$SRC/preserve.ts" \

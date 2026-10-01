@@ -7,7 +7,7 @@ describe("isTwiddleCommand", () => {
 	});
 
 	it("matches twiddle subcommands", () => {
-		expect(isTwiddleCommand("/twiddle-model")).toBe(true);
+		expect(isTwiddleCommand("/twiddle-compare")).toBe(true);
 	});
 
 	it("ignores non-twiddle commands", () => {
@@ -45,7 +45,7 @@ describe("decideMissingModelSetup", () => {
 
 	it("does not prompt for twiddle setup commands", () => {
 		expect(
-			decideMissingModelSetup("/twiddle-model", {
+			decideMissingModelSetup("/twiddle-compare", {
 				hasModel: false,
 				sessionSilenced: false,
 			}),

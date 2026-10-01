@@ -23,7 +23,7 @@ export interface TwiddleConfig {
 	verbose?: "quiet" | "debug";
 	/** Optimization timeout in seconds (default: 15) */
 	timeout?: number;
-	/** Minimum prompt length (characters) for auto-mode. Default is 0 */
+	/** Minimum prompt length (characters) for auto-mode. Default is 1 */
 	minChars?: number;
 	/** Fallback models tried if primary times out */
 	fallbackModels?: TwiddleModelRef[];

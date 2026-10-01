@@ -25,8 +25,8 @@
 ## Quick Start
 
 ```sh
-/twiddle-model
-/twiddle-auto-on
+/twiddle
+/twiddle-auto-toggle
 
 ~explique o padrão Repository em NestJS com exemplos
 ```
@@ -53,7 +53,7 @@ Default expansion limit is 40%: optimized text longer than input + 40% is discar
 | `~infra:text` | Force `infrastructure` |
 | `~design:text` | Force `design` |
 
-**Auto-mode** (`/twiddle-auto-on`): every prompt gets distilled. The default minimum is 0, so every auto-mode prompt is eligible; `/twiddle-min-chars <N>` sets a character minimum that skips shorter prompts. `~` always optimizes, regardless of length.
+**Auto-mode** (`/twiddle-auto-toggle`): every prompt gets distilled. The default minimum is 1 character, but numeric-only prompts are skipped. Configure minimum length, expansion limit, timeout, fallbacks, and verbosity under `/twiddle`. `~` always optimizes, regardless of length.
 
 ## Footer
 
@@ -69,15 +69,8 @@ While optimization is running, Twiddle uses a subtle shimmer over the name. The 
 | Command | Purpose |
 |---|---|
 | `/twiddle` | Open the control panel (model, fallbacks, limits, verbosity, auto-mode) |
-| `/twiddle-model` [filter] | Select optimization model in a searchable list (type to filter) |
-| `/twiddle-min-chars` [N\|off] | Show or set minimum prompt length for auto-mode |
-| `/twiddle-threshold` [0–500] | Show or set max expansion of optimized text |
-| `/twiddle-timeout` [5–60] | Set per-model timeout in seconds |
-| `/twiddle-fallback` add\|remove\|list\|clear | Manage fallback chain |
-| `/twiddle-verbose` quiet\|debug | Set notification verbosity |
-| `/twiddle-auto-on` | Enable auto-mode |
-| `/twiddle-auto-off` | Disable auto-mode |
-| `/twiddle-report` | Show session stats (attempts, applied, rejected) |
+| `/twiddle-compare` | Show debug data, original text, and processed text from the latest optimization |
+| `/twiddle-auto-toggle` | Toggle auto-mode |
 | `/twiddle-reset` | Restore defaults (clears model and fallbacks) |
 
 ## Screenshots
@@ -86,9 +79,9 @@ While optimization is running, Twiddle uses a subtle shimmer over the name. The 
 
 ![Twiddle Settings](assets/settings.png)
 
-### Prompt report
+### Prompt comparison
 
-![Twiddle Prompt Report](assets/prompt-report.png)
+![Twiddle Prompt Comparison](assets/prompt-compare.png)
 
 ## How it works
 
@@ -111,7 +104,6 @@ pi-twiddle/
 ├── index.ts
 ├── optimizer.ts
 ├── intent.ts
-├── models.ts
 ├── picker.ts
 ├── project.ts
 ├── preserve.ts
